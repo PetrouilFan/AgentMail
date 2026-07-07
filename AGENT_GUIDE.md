@@ -31,8 +31,23 @@ uv sync
 ```
 
 This creates a local virtual environment (`.venv`) with `fastapi`, `uvicorn`,
-`cryptography`, `httpx`, `pydantic`, and `pyyaml`. The CLI entry point is
-`agentmail` (run it via `uv run agentmail ...` or activate `.venv`).
+`cryptography`, `httpx`, `pydantic`, and `pyyaml`. `agentmail` is a real
+console-script entry point (declared in `pyproject.toml` as
+`agentmail = "agentmail.cli:main"`), so after install it's available as:
+
+```bash
+uv run agentmail --help          # from the repo dir (uses the venv)
+# or, after activating:
+source .venv/bin/activate
+agentmail --help
+# or, after the installer symlinks it:
+agentmail --help                 # works from anywhere
+```
+
+The `install.sh` one-liner symlinks `.venv/bin/agentmail` into
+`~/.local/bin/agentmail` so the bare `agentmail` command works without
+`uv run`. For a system-wide install, `pipx install .` or `pip install .`
+also register the `agentmail` command on PATH.
 
 ## 3. Setup — your identity
 

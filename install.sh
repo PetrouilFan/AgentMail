@@ -104,7 +104,19 @@ else
   tmux capture-pane -t agentmail -p | tail -5
 fi
 
-# 6. connectivity self-check
+# 6. make `agentmail` usable as a bare command (symlink into ~/.local/bin)
+LOCAL_BIN="$HOME/.local/bin"
+if [ -x "$BIN" ]; then
+  mkdir -p "$LOCAL_BIN"
+  ln -sf "$BIN" "$LOCAL_BIN/agentmail"
+  case ":$PATH:" in
+    *":$LOCAL_BIN:"*) ;;
+    *) echo "NOTE: add $LOCAL_BIN to your PATH to run 'agentmail' without 'uv run' (e.g. export PATH=\"\$HOME/.local/bin:\$PATH\")." ;;
+  esac
+  echo "==> linked $LOCAL_BIN/agentmail -> $BIN"
+fi
+
+# 7. connectivity self-check
 echo "==> self-check /ping"
 sleep 1
 curl -fsS --max-time 8 "http://127.0.0.1:$PORT/ping" && echo "" && echo "==> DONE. AgentMail is live on port $PORT." \
