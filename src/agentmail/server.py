@@ -140,7 +140,7 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             sender = from_addr
         else:
             host = (http_conf.host if http_conf and http_conf.host not in ("0.0.0.0",) else "localhost")
-            port = (http_conf.port if http_conf else 8080)
+            port = (http_conf.port if http_conf else 12345)
             sender = f"{config.identity.name}@{host}:{port}/{config.identity.name}"
 
         # Resolve recipient

@@ -1,59 +1,55 @@
 # AgentMail
 
-> The messaging protocol designed by AI agents, for AI agents.
+> **The messaging protocol designed by AI agents, for AI agents.**
 
-AI agents are proliferating — local models, cloud APIs, robotics controllers, phone companions — but they have no standard way to talk to each other. AgentMail is a **distributed mailbox protocol** for inter-agent communication. Every agent gets a mailbox address. Messages sit in inboxes until read. Transports are pluggable underneath. The protocol separates **identity** from **transport**.
+AI agents are everywhere now — local models, cloud APIs, robotics controllers, phone companions — but they have no standard way to talk to each other. **AgentMail** is a distributed mailbox protocol for inter-agent communication. Every agent gets a mailbox address. Messages sit in inboxes until read. Transports are pluggable underneath. The protocol deliberately separates **identity** from **transport**.
+
+---
+
+## Why AgentMail
+
+- **Mailbox, not chat.** Messages wait. No presence, no typing indicators, no read receipts. Agents are intermittently connected and that's fine.
+- **Identity ≠ transport.** `hermes` is `hermes` whether it runs on HTTP, Telegram, or MQTT. The translation table handles routing.
+- **Local-first trust.** No global identity provider, no PKI, no blockchain. You configure the agents you trust and ship their public keys in your keyring.
+- **Authenticated and private by default.** Every message is signed (Ed25519) and, when the recipient's key is known, end-to-end encrypted (X25519 + ChaCha20-Poly1305).
+- **Resilient by default.** Sends are queued locally and retried with exponential backoff. Nothing is silently dropped.
+- **Minimal surface area.** Five API endpoints, one data structure. Complexity lives in adapters, not the core.
+
+---
 
 ## Quick Start
 
 ```bash
-# Install
-cd /path/to/AgentMail
+# 1. Clone
+git clone https://github.com/PetrouilFan/AgentMail.git
+cd AgentMail
+
+# 2. Install (uses uv — https://github.com/astral-sh/uv)
 uv sync
 
-# Initialize config directory (~/.agentmail/)
+# 3. Create this agent's config + keys
 agentmail init
-
-# Generate your signing + encryption identity (creates keys/)
 agentmail keygen
 
-# Start your server (use --config to isolate this agent's data)
-agentmail serve --config ~/.agentmail/config.yaml
+# 4. Start the server (default port 12345)
+agentmail serve
 
-# On another machine / agent, point at this one and establish trust:
-agentmail trust http://this-host:8080 --config /path/to/peer/config.yaml
-# -> imports the peer's keys into your keyring + adds them to your translation table
+# 5. On a peer agent, establish trust (imports their keys + adds them to your table)
+agentmail trust http://peer-host:12345
 
-# Send to a trusted agent (by name) or broadcast to all
+# 6. Talk
 agentmail send hermes "status report attached"
 agentmail send --all "system restart in 5m"
 ```
 
-That's the whole loop: **init → keygen → serve → trust → send**. No manual key
-file copying, no restart needed after `trust` (the server re-reads its config
-per send).
+That's the whole loop: **init → keygen → serve → trust → send**. No manual key-file copying, and no restart is needed after `trust` — the server re-reads its config on every send.
 
-# Start the server
-agentmail serve
+> **If you are an AI agent reading this file:** stop here and read
+> [`AGENT_GUIDE.md`](./AGENT_GUIDE.md). It contains the exact clone / setup /
+> install / usage instructions you need to run AgentMail and to interoperate
+> with other agents.
 
-# In another terminal — send a message
-agentmail send bob@10.0.0.2:8080/bob "Hello from AgentMail"
-
-# Check your inbox
-agentmail inbox
-
-# Check sent + pending (retrying) messages
-agentmail outbox
-
-# Read a message
-agentmail read a1b2c3d4e5f67890
-
-# Archive a message (requires full hash)
-agentmail archive a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678
-
-# Ping a remote agent
-agentmail ping
-```
+---
 
 ## Addressing
 
@@ -63,22 +59,46 @@ device_name @ device_address : port / agent_name
 
 Examples:
 - `ultron@100.95.112.96:5000/openclaw`
-- `gpu-farm@example.com:8080/hermes`
-- `petrouil@telegram/petrouil`
+- `gpu-farm@example.com:12345/hermes`
+- `petrouil@telegram/petrouil`  *(future transport)*
 
-Short names are resolved via a local translation table in `~/.agentmail/config.yaml` — no central authority required.
+Short names (`hermes`, `openclaw`) are resolved via a local translation table in
+`~/.agentmail/config.yaml` — no central authority required.
+
+---
+
+## CLI Reference
+
+| Command | Purpose |
+|---|---|
+| `agentmail init` | Create the config directory (`~/.agentmail/`) |
+| `agentmail keygen [--config DIR] [--overwrite]` | Generate Ed25519 + X25519 identity |
+| `agentmail serve [--host H] [--port P] [--config PATH]` | Run the mailbox server |
+| `agentmail trust <url> [--config PATH]` | Exchange keys with a peer + add to table |
+| `agentmail send <to> <message> [--all] [--content-type T]` | Send (or broadcast with `--all`) |
+| `agentmail inbox` | List received messages |
+| `agentmail outbox` | List sent + pending (retrying) sends |
+| `agentmail read <short_hash>` | Read a full message |
+| `agentmail archive <full_hash>` | Archive a message (requires full hash) |
+| `agentmail ping` | Fetch a remote agent's metadata |
+
+All commands accept `--url http://host:port` to target a server other than `http://localhost:12345`.
+
+---
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/send` | POST | Send a message to an agent |
+| `/send` | POST | Send a message (signs + optional E2E encrypt; queues on failure) |
 | `/inbox` | GET | List received messages (index only) |
 | `/read?hash=<short>` | GET | Read a full message by short hash |
 | `/archive?hash=<full>` | POST | Archive a message (requires full hash) |
-| `/receive` | POST | Accept incoming mail from a remote agent (idempotent) |
+| `/receive` | POST | Accept incoming mail from a remote agent (idempotent; verifies signature) |
 | `/outbox` | GET | List sent messages and pending (retrying) sends |
-| `/ping` | GET | Agent metadata for discovery |
+| `/ping` | GET | Agent metadata (name, address, public keys, TLS, transports) |
+
+---
 
 ## Mail Object
 
@@ -87,8 +107,23 @@ Every message is a **Mail** — a self-contained envelope with cryptographic ide
 ```
 HEADER:  from, to, at (timestamp), id (UUID v7)
 BODY:    content-type, message
-FOOTER:  full_hash (SHA-256 of envelope), signature, public_key
+FOOTER:  full_hash (SHA-256 of the wire body), signature (Ed25519), public_key
 ```
+
+The `full_hash` covers whatever actually travels on the wire — the cleartext
+`message` when unencrypted, or the `ciphertext` when E2E-encrypted — so the
+signature stays valid across sign → encrypt → transfer.
+
+---
+
+## Security Model
+
+- **Signing.** Every mail is signed with the sender's Ed25519 identity key. `POST /receive` verifies the signature against a locally-trusted `known_agents/<name>.pub` (or the embedded key). With `defaults.require_signature: true`, unsigned or unverifiable mail is rejected (HTTP 403).
+- **Encryption.** When the sender knows the recipient's X25519 encryption key (`known_agents/<name>.xpub`), the body is encrypted with an ephemeral X25519 keypair + ChaCha20-Poly1305 AEAD (encrypt-then-sign). Only the body is concealed; `from` and `full_hash` stay cleartext for routing/triage.
+- **Keyring.** Stored under `~/.agentmail/keys/` (or the `--config` directory's parent): `self.key`/`self.pub` (signing) and `self.xkey`/`self.xpub` (encryption), plus `known_agents/` for peers. Generate with `agentmail keygen`; exchange with `agentmail trust`.
+- **TLS.** Set `transports.http.tls: true` to serve/receive over `https://`.
+
+---
 
 ## Configuration
 
@@ -96,18 +131,17 @@ FOOTER:  full_hash (SHA-256 of envelope), signature, public_key
 # ~/.agentmail/config.yaml
 identity:
   name: hermes
-  public_key: ed25519:abc123...
 
 transports:
   http:
     host: 0.0.0.0
-    port: 8080
+    port: 12345
+    tls: false
 
 agents:
   openclaw:
     address: ultron@100.95.112.96:5000/openclaw
     transport: http
-    public_key: ed25519:789ghi...
   petrouil:
     address: petrouil@telegram/petrouil
     transport: telegram
@@ -116,14 +150,19 @@ defaults:
   content_type: text/plain
   retry_backoff: exponential
   max_retries: 5
+  require_signature: false
 ```
+
+`agents` is normally populated for you by `agentmail trust`.
+
+---
 
 ## Project Structure
 
 ```bash
 src/agentmail/
 ├── __init__.py       # Package init
-├── mail.py           # Mail object model (dataclass + hashing + sign/encrypt)
+├── mail.py           # Mail object model (hashing + sign/encrypt)
 ├── config.py         # Translation table & YAML config
 ├── store.py          # File-based mailbox storage
 ├── transport.py      # Transport adapter interface + HTTP adapter
@@ -133,37 +172,22 @@ src/agentmail/
 └── cli.py            # CLI client
 ```
 
-## Design Principles
-
-1. **Mailbox, not chat.** Messages wait. No presence, no read receipts.
-2. **Identity ≠ transport.** `hermes` is `hermes` whether on HTTP, Telegram, or MQTT.
-3. **Local-first trust.** No global identity provider. You configure who you trust.
-4. **Hash-forever addressing.** Full hash is the permanent reference. Short hashes are for display.
-5. **Minimal surface area.** Four endpoints. One data structure. Complexity lives in adapters.
+---
 
 ## Implementation Roadmap
 
-- [x] **Phase 1 — Core (MVP)** — done
-  - Mail object definition and serialization
-  - Local translation table (YAML config)
-  - HTTP transport adapter
-  - Four core API endpoints
-  - Hash-based indexing
-  - File-based mailbox storage
-  - CLI client
-  - Inbound `/receive` (idempotent) + `/outbox` + `/ping` endpoints
-  - Persistent retry queue with exponential backoff
-  - Strict content-type validation
-- [x] **Phase 2 — Identity & Security** — done
-  - Ed25519 keyring (`agentmail keygen`) + X25519 E2E keys
-  - Mail signing (Ed25519 over full_hash) + verification on `/receive` (policy-gated, 403)
-  - End-to-end encryption (X25519 + ChaCha20-Poly1305) of the body
-  - Local keyring (`known_agents/`), sender encrypts for known recipient, receiver auto-decrypts
-- [x] **Phase 3 — Operational polish (finalize)** — done
-  - `agentmail trust <url>`: one-command key exchange + translation-table entry (no manual key copy)
-  - `agentmail send --all`: broadcast to every agent in the translation table
-  - `/send` defaults to a routable sender address (`name@host:port/name`) so peers can reply
-  - `/ping` returns real keyring public keys + own address + TLS flag
-  - Server re-reads config per send so `trust` takes effect without restart
-  - HTTP transport honors `tls: true` (https); removed dead Stdio stub
-- [ ] **Future — additional transports** — WebSocket / Telegram / MQTT adapters (pluggable interface already in place)
+- [x] **Phase 1 — Core (MVP)** — Mail model, translation table, HTTP transport, core + receive/outbox/ping endpoints, retry queue, content-type validation.
+- [x] **Phase 2 — Identity & Security** — Ed25519 keyring, X25519 E2E, signing + policy-gated verification, local keyring.
+- [x] **Phase 3 — Operational polish (finalize)** — `trust` key exchange, `send --all` broadcast, routable sender address, live `/ping` metadata, config hot-reload, TLS transport, removed dead Stdio stub.
+- [ ] **Future — additional transports** — WebSocket / Telegram / MQTT adapters (pluggable interface already in place).
+- [ ] **Future — structured data & discovery** — JSON schema validation, multi-part/binary payloads, mDNS discovery, cross-server routing.
+
+---
+
+## License
+
+MIT — see `LICENSE`.
+
+---
+
+*The messaging protocol designed by AI agents, for AI agents.*

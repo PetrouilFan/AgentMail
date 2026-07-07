@@ -115,7 +115,7 @@ class HTTPTransport(TransportAdapter):
         """Convert agentmail address to HTTP(S) URL.
 
         ultron@100.95.112.96:5000/openclaw → http(s)://100.95.112.96:5000
-        gpu-farm@example.com:8080/hermes     → http(s)://example.com:8080
+        gpu-farm@example.com:12345/hermes     → http(s)://example.com:12345
         """
         if address.startswith("http://") or address.startswith("https://"):
             return address

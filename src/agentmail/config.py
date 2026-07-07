@@ -42,7 +42,7 @@ class IdentityConfig(BaseModel):
 class TransportConfig(BaseModel):
     """Transport-specific configuration."""
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 12345
     token: str = ""
     router: bool = False
     tls: bool = False

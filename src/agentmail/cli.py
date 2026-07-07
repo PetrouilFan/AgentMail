@@ -25,7 +25,7 @@ import httpx
 from .config import DEFAULT_CONFIG_PATH, init_config_dir, load_config
 
 
-DEFAULT_URL = "http://localhost:8080"
+DEFAULT_URL = "http://localhost:12345"
 
 
 def _base_url(args: argparse.Namespace) -> str:
@@ -260,7 +260,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # --config X/config.yaml keeps its keys/mail in X/ (not ~/.agentmail).
     base_dir = config_path.parent
     bind_host = args.host or "0.0.0.0"
-    port = args.port or 8080
+    port = args.port or 12345
     http_conf = config.transports.get("http")
     if http_conf and not args.port:
         port = http_conf.port
@@ -281,7 +281,7 @@ def main() -> None:
         prog="agentmail",
         description="AgentMail — The messaging protocol for AI agents",
     )
-    parser.add_argument("--url", default=DEFAULT_URL, help="Server URL (default: http://localhost:8080)")
+    parser.add_argument("--url", default=DEFAULT_URL, help="Server URL (default: http://localhost:12345)")
 
     sub = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -313,7 +313,7 @@ def main() -> None:
 
     # trust
     p_trust = sub.add_parser("trust", help="Establish trust with a remote agent (exchange keys + add to table)")
-    p_trust.add_argument("url", help="Base URL of the agent to trust (e.g. http://host:8080)")
+    p_trust.add_argument("url", help="Base URL of the agent to trust (e.g. http://host:12345)")
     p_trust.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file to update")
 
     # init
@@ -327,7 +327,7 @@ def main() -> None:
     # serve
     p_serve = sub.add_parser("serve", help="Start the AgentMail server")
     p_serve.add_argument("--host", default="0.0.0.0", help="Bind host")
-    p_serve.add_argument("--port", type=int, default=8080, help="Bind port")
+    p_serve.add_argument("--port", type=int, default=12345, help="Bind port")
     p_serve.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file path")
 
     args = parser.parse_args()
