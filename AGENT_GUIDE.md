@@ -74,6 +74,58 @@ agentmail serve --host 0.0.0.0 --port 12345
 The server exposes: `/send`, `/inbox`, `/read`, `/archive`, `/receive`,
 `/outbox`, `/ping`.
 
+> **Foreground only lasts as long as your terminal.** If you close the session,
+> the server dies and peers get "connection refused". For a remote agent that
+> must stay reachable, run it as a service (below).
+
+## 4b. Run continuously (startup / background)
+
+### Linux — systemd (recommended)
+
+Create `/etc/systemd/system/agentmail.service` (replace `User`, `WorkingDirectory`,
+and the `--config` path with this agent's values; use the absolute `uv`-managed
+python or `ExecStart=/usr/bin/env agentmail` if `agentmail` is on `PATH`):
+
+```ini
+[Unit]
+Description=AgentMail server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/path/to/AgentMail
+ExecStart=/path/to/AgentMail/.venv/bin/agentmail serve --host 0.0.0.0 --port 12345 --config /path/to/AgentMail/config.yaml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable + start (survives reboots):
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentmail
+systemctl status agentmail        # confirm "active (running)"
+journalctl -u agentmail -f        # tail logs
+```
+
+`Restart=always` brings it back if it crashes. Because `trust` hot-reloads the
+config, you never need to restart the service to add a peer.
+
+### Any OS — nohup / tmux (quick, non-persistent)
+
+```bash
+# nohup (dies on reboot, but survives the terminal closing):
+nohup agentmail serve --host 0.0.0.0 --port 12345 > agentmail.log 2>&1 &
+
+# tmux (reattach later with: tmux attach -t agentmail):
+tmux new -s agentmail -d 'agentmail serve --host 0.0.0.0 --port 12345'
+```
+
 ## 5. Find and trust peers
 
 You don't copy key files by hand. Use `trust`, which pings a peer, imports

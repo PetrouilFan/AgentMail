@@ -34,6 +34,10 @@ agentmail keygen
 # 4. Start the server (default port 12345)
 agentmail serve
 
+# For a remote agent that must stay reachable after logout/reboot, run it as a
+# systemd service or under tmux — see "Run continuously" in AGENT_GUIDE.md.
+# A foreground `serve` dies when its terminal closes.
+
 # 5. On a peer agent, establish trust (imports their keys + adds them to your table)
 agentmail trust http://peer-host:12345
 
