@@ -8,6 +8,7 @@ Usage:
     agentmail archive <full_hash>
     agentmail ping
     agentmail init                         — initialize config directory
+    agentmail keygen [--overwrite]         — generate local signing + encryption keys
     agentmail serve [--host HOST] [--port PORT]
 """
 
@@ -160,11 +161,29 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"  Edit {config_dir / 'config.yaml'} to configure agents and transports.")
 
 
+def cmd_keygen(args: argparse.Namespace) -> None:
+    """Generate or regenerate the local cryptographic identity."""
+    from .crypto import KeyRing
+
+    kr = KeyRing()
+    existed = kr.has_identity()
+    kr.generate(overwrite=args.overwrite)
+    print(f"✓ {'Regenerated' if existed and args.overwrite else 'Generated'} identity at {kr.keys_dir}")
+    print(f"  Signing pub:  {kr.keys_dir / 'self.pub'}")
+    print(f"  Enc pub:      {kr.keys_dir / 'self.xpub'}")
+    print("  Share the .pub / .xpub files with agents you trust (add to their known_agents/).")
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     """Start the AgentMail server."""
     import uvicorn
+    from pathlib import Path as _Path
 
-    config = load_config()
+    config_path = _Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+    config = load_config(config_path)
+    # Mailbox + keyring root follows the config file's directory, so a custom
+    # --config X/config.yaml keeps its keys/mail in X/ (not ~/.agentmail).
+    base_dir = config_path.parent
     bind_host = args.host or "0.0.0.0"
     port = args.port or 8080
     http_conf = config.transports.get("http")
@@ -173,11 +192,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     print(f"Starting AgentMail server on {bind_host}:{port}")
     print(f"  Identity: {config.identity.name}")
-    print(f"  Config: {DEFAULT_CONFIG_PATH}")
+    print(f"  Config: {config_path}")
 
     # Import the app factory — use the config_path if specified
     from .server import create_app
-    app = create_app(config_path=Path(args.config) if args.config else None)
+    app = create_app(config_path=config_path, base_dir=base_dir)
     uvicorn.run(app, host=bind_host, port=port)
 
 
@@ -218,6 +237,10 @@ def main() -> None:
     # init
     sub.add_parser("init", help="Initialize config directory")
 
+    # keygen
+    p_keygen = sub.add_parser("keygen", help="Generate local signing + encryption keys")
+    p_keygen.add_argument("--overwrite", action="store_true", help="Overwrite existing keys")
+
     # serve
     p_serve = sub.add_parser("serve", help="Start the AgentMail server")
     p_serve.add_argument("--host", default="0.0.0.0", help="Bind host")
@@ -234,6 +257,7 @@ def main() -> None:
         "archive": cmd_archive,
         "ping": cmd_ping,
         "init": cmd_init,
+        "keygen": cmd_keygen,
         "serve": cmd_serve,
     }
 

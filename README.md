@@ -14,6 +14,11 @@ uv sync
 # Initialize config directory (~/.agentmail/)
 agentmail init
 
+# Generate your signing + encryption identity (creates keys/)
+agentmail keygen
+
+# Exchange public keys with peers (drop their .pub/.xpub into keys/known_agents/)
+
 # Edit config to add agents
 vim ~/.agentmail/config.yaml
 
@@ -107,11 +112,12 @@ defaults:
 ```bash
 src/agentmail/
 ├── __init__.py       # Package init
-├── mail.py           # Mail object model (dataclass + hashing)
+├── mail.py           # Mail object model (dataclass + hashing + sign/encrypt)
 ├── config.py         # Translation table & YAML config
 ├── store.py          # File-based mailbox storage
 ├── transport.py      # Transport adapter interface + HTTP adapter
 ├── queue.py          # Persistent retry queue (exponential backoff)
+├── crypto.py         # Keyring, Ed25519 signing, X25519 + ChaCha20-Poly1305 E2E
 ├── server.py         # FastAPI application (core + receive/outbox/ping)
 └── cli.py            # CLI client
 ```
@@ -137,7 +143,11 @@ src/agentmail/
   - Inbound `/receive` (idempotent) + `/outbox` + `/ping` endpoints
   - Persistent retry queue with exponential backoff
   - Strict content-type validation
-- [ ] **Phase 2 — Identity & Security** — Ed25519 signing, X25519+ChaCha20 encryption, local keyring
+- [x] **Phase 2 — Identity & Security** — done
+  - Ed25519 keyring (`agentmail keygen`) + X25519 E2E keys
+  - Mail signing (Ed25519 over full_hash) + verification on `/receive` (policy-gated, 403)
+  - End-to-end encryption (X25519 + ChaCha20-Poly1305) of the body
+  - Local keyring (`known_agents/`), sender encrypts for known recipient, receiver auto-decrypts
 - [ ] **Phase 3 — Multi-Transport** — WebSocket, Telegram, MQTT adapters
 - [ ] **Phase 4 — Structured Data** — JSON schema validation, multi-part messages, binary payloads
 - [ ] **Phase 5 — Discovery & Federation** — mDNS, /ping metadata, cross-server routing

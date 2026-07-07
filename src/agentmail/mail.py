@@ -1,18 +1,41 @@
 """Mail object definition and serialization.
 
 Every message is a Mail — a self-contained envelope with cryptographic identity.
+
+The ``full_hash`` is computed over the core envelope (from/to/at/id/content-type/
+message) and serves as the canonical permanent identifier. The signature and
+encryption fields are NOT part of the hash input, so signing and hashing stay
+independent and stable across hops.
+
+Cryptographic fields:
+    signature     Ed25519 signature over full_hash (sender's identity key)
+    public_key    base64 Ed25519 public key of the sender (for verification)
+    encrypted     bool — True if the body is E2E-encrypted
+    ciphertext    base64 ChaCha20-Poly1305 ciphertext (when encrypted)
+    nonce         base64 nonce (when encrypted)
+    ephemeral_key base64 X25519 ephemeral public key (when encrypted)
+
+When ``encrypted`` is True the cleartext ``message`` is empty and the body lives
+in ``ciphertext``. The inbox still shows ``from`` and ``full_hash`` cleartext for
+routing/triage; only the body is concealed.
 """
 
 from __future__ import annotations
 
 import hashlib
+import base64
 import uuid
 import uuid6
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from pydantic import BaseModel, Field, field_validator
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+
+from .crypto import KeyRing, sign_message, verify_signature, encrypt_body, decrypt_body
 
 
 class ContentType(str, Enum):
@@ -25,20 +48,25 @@ class ContentType(str, Enum):
 
 
 class Mail(BaseModel):
-    """A single Mail message — the core data structure of AgentMail.
-
-    The ``full_hash`` is computed over the envelope (header + body, excluding the
-    ``full_hash`` field itself) and serves as the canonical permanent identifier.
-    The short hash (``full_hash[:16]``) is used for interactive display and indexing.
-    """
+    """A single Mail message — the core data structure of AgentMail."""
 
     from_addr: str = Field(..., description="Full address of the sender")
     to_addr: str = Field(..., description="Full address of the recipient")
     at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     id: str = Field(default_factory=lambda: str(uuid6.uuid7()))
     content_type: ContentType = Field(default=ContentType.TEXT_PLAIN)
-    message: str = Field(..., description="The payload body")
-    full_hash: str = Field(default="", description="SHA-256 of the envelope (auto-computed)")
+    message: str = Field(default="", description="The payload body (cleartext unless encrypted)")
+    full_hash: str = Field(default="", description="SHA-256 of the core envelope (auto-computed)")
+
+    # ── Cryptographic footer (Ed25519 identity) ──
+    signature: str = Field(default="", description="Ed25519 signature over full_hash")
+    public_key: str = Field(default="", description="base64 Ed25519 public key of sender")
+
+    # ── End-to-end encryption (X25519 + ChaCha20-Poly1305) ──
+    encrypted: bool = Field(default=False, description="True if body is E2E-encrypted")
+    ciphertext: str = Field(default="", description="base64 AEAD ciphertext (when encrypted)")
+    nonce: str = Field(default="", description="base64 nonce (when encrypted)")
+    ephemeral_key: str = Field(default="", description="base64 X25519 ephemeral pubkey (when encrypted)")
 
     @field_validator("at", mode="before")
     @classmethod
@@ -58,20 +86,104 @@ class Mail(BaseModel):
         return self.full_hash[:16]
 
     def _compute_hash(self) -> str:
-        """Compute SHA-256 digest over the envelope minus the hash field."""
+        """Compute SHA-256 digest over the core envelope (crypto fields excluded).
+
+        The body used for hashing is the cleartext ``message`` when not encrypted,
+        or the ``ciphertext`` when E2E-encrypted — i.e. whatever actually travels
+        on the wire. This keeps the hash stable across sign → encrypt → transfer.
+        """
+        body = self.ciphertext if self.encrypted else self.message
         payload = (
             f"{self.from_addr}\n"
             f"{self.to_addr}\n"
             f"{self.at.isoformat()}\n"
             f"{self.id}\n"
             f"{self.content_type.value}\n"
-            f"{self.message}"
+            f"{body}"
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def verify_hash(self) -> bool:
         """Re-compute hash and compare — integrity check."""
         return self._compute_hash() == self.full_hash
+
+    # ── Signing / verification ─────────────────────────────────
+
+    def sign(self, keyring: KeyRing) -> None:
+        """Sign this Mail with the local identity key.
+
+        Computes the signature over full_hash and stamps the sender's public
+        key into the envelope. Idempotent — re-signing overwrites.
+        """
+        if not self.full_hash:
+            self.full_hash = self._compute_hash()
+        self.signature = sign_message(keyring.signing_private(), self.full_hash)
+        self.public_key = base64.b64encode(keyring.self_signing_public_pem()).decode("ascii")
+
+    def verify_signature(self, keyring: KeyRing) -> bool:
+        """Verify the Ed25519 signature against a trusted known-agent key.
+
+        The sender's agent name is derived from the ``from`` address
+        (device_name@.../agent_name). Returns False if unsigned or unknown.
+        """
+        if not self.signature:
+            return False
+        # Prefer a locally-trusted known-agent key by sender name.
+        sender_name = self.from_addr.split("/")[-1] if "/" in self.from_addr else self.from_addr
+        known = keyring.known_signing_public(sender_name)
+        if known is not None:
+            return verify_signature(known, self.full_hash, self.signature)
+        # Fall back to the embedded public key (still proves the signer holds
+        # the private key matching the key they advertised).
+        if not self.public_key:
+            return False
+        try:
+            pub = cast(
+                ed25519.Ed25519PublicKey,
+                serialization.load_pem_public_key(base64.b64decode(self.public_key)),
+            )
+        except Exception:
+            return False
+        return verify_signature(pub, self.full_hash, self.signature)
+
+    # ── E2E encryption ─────────────────────────────────────────
+
+    def encrypt_for(self, recipient_enc_public_pem: bytes) -> None:
+        """Encrypt the body for a recipient (X25519 + ChaCha20-Poly1305).
+
+        Replaces ``message`` with the ciphertext fields and sets ``encrypted``.
+        The recipient's X25519 public key is supplied as PEM bytes.
+        """
+        recipient_pub = cast(
+            x25519.X25519PublicKey,
+            serialization.load_pem_public_key(recipient_enc_public_pem),
+        )
+        ephemeral = x25519.X25519PrivateKey.generate()
+        ct, nonce, epk = encrypt_body(recipient_pub, ephemeral, self.message.encode("utf-8"))
+        self.ciphertext = ct
+        self.nonce = nonce
+        self.ephemeral_key = epk
+        self.encrypted = True
+        self.message = ""  # cleartext no longer carried in the envelope
+        # Recompute the hash over the ciphertext (the body that travels), so
+        # the signature (applied after encrypt) covers the wire representation.
+        self.full_hash = self._compute_hash()
+        self.signature = ""  # must be re-signed over the new hash
+
+    def decrypt(self, keyring: KeyRing) -> str:
+        """Decrypt the body using the local identity encryption key.
+
+        Returns the cleartext message. Raises ValueError if not encrypted or
+        decryption fails.
+        """
+        if not self.encrypted:
+            return self.message
+        plaintext = decrypt_body(
+            self.ephemeral_key, self.nonce, self.ciphertext, keyring.enc_private()
+        )
+        return plaintext.decode("utf-8")
+
+    # ── Serialization ──────────────────────────────────────────
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to a flat dict suitable for JSON storage or API responses."""
@@ -83,6 +195,12 @@ class Mail(BaseModel):
             "content-type": self.content_type.value,
             "message": self.message,
             "full_hash": self.full_hash,
+            "signature": self.signature,
+            "public_key": self.public_key,
+            "encrypted": str(self.encrypted),
+            "ciphertext": self.ciphertext,
+            "nonce": self.nonce,
+            "ephemeral_key": self.ephemeral_key,
         }
 
     @classmethod
@@ -94,6 +212,12 @@ class Mail(BaseModel):
             at=data["at"],
             id=data["id"],
             content_type=ContentType(data.get("content-type", "text/plain")),
-            message=data["message"],
+            message=data.get("message", ""),
             full_hash=data.get("full_hash", ""),
+            signature=data.get("signature", ""),
+            public_key=data.get("public_key", ""),
+            encrypted=data.get("encrypted", "False") in ("True", "true", "1"),
+            ciphertext=data.get("ciphertext", ""),
+            nonce=data.get("nonce", ""),
+            ephemeral_key=data.get("ephemeral_key", ""),
         )

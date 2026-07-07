@@ -193,3 +193,89 @@ class TestPingEndpoint:
         assert data["name"] == "testagent"
         assert "version" in data
         assert "transports" in data
+
+
+@pytest.fixture
+def secured_client(tmp_path):
+    """Client with a real keyring, a known agent 'peer', and require_signature on."""
+    from agentmail.crypto import KeyRing
+
+    base = Path(tmp_path / "data")
+    kr = KeyRing(base_dir=base)
+    kr.generate()
+    # Known agent 'peer' (we act as both ends in the test)
+    peer = KeyRing(Path(tmp_path / "peer"))
+    peer.generate()
+    kr.add_known_agent("peer", peer.self_signing_public_pem(), peer.self_enc_public_pem())
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "identity:\n  name: testagent\n  public_key: ''\n"
+        "transports: {}\nagents: {}\n"
+        "defaults:\n  content_type: text/plain\n  require_signature: true\n"
+    )
+    app = create_app(config_path=config_file, base_dir=base)
+    app.extra["peer_keyring"] = peer
+    return TestClient(app)
+
+
+class TestSecurityEndpoints:
+    """Signing + encryption flow through the server."""
+
+    def test_send_signs_when_identity_exists(self, secured_client):
+        from agentmail.mail import Mail
+        from agentmail.crypto import KeyRing
+        import json
+        from pathlib import Path
+
+        # bob is unreachable → queued, but the outbox copy must be signed.
+        secured_client.post("/send", params={"to": "bob@10.0.0.2:8080/bob", "message": "hi"})
+        base = Path(secured_client.app.extra.get("base_dir"))
+        kr = KeyRing(base_dir=base)
+        qpath = list((base / "queue").glob("*.pending"))
+        assert qpath, "expected a queued send"
+        pending_mail = json.loads(qpath[0].read_text())["mail"]
+        m = Mail.from_dict(pending_mail)
+        assert m.signature, "sent mail should be signed"
+        assert m.verify_signature(kr) is True
+
+    def test_receive_requires_signature_when_policy_on(self, secured_client):
+        from agentmail.mail import Mail
+
+        # Unsigned mail must be rejected (403)
+        m = Mail(from_addr="peer@h/peer", to_addr="testagent@localhost", message="unsigned")
+        resp = secured_client.post("/receive", json=m.to_dict())
+        assert resp.status_code == 403
+
+    def test_receive_accepts_signed_mail(self, secured_client):
+        from agentmail.crypto import KeyRing
+        from agentmail.mail import Mail
+
+        base = Path(secured_client.app.extra.get("base_dir"))
+        peer = secured_client.app.extra["peer_keyring"]
+        m = Mail(from_addr="peer@h/peer", to_addr="testagent@localhost", message="signed hello")
+        m.sign(peer)  # signed by peer, whom testagent trusts
+        resp = secured_client.post("/receive", json=m.to_dict())
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "received"
+
+    def test_receive_decrypts_e2e_body(self, secured_client):
+        from agentmail.crypto import KeyRing
+        from agentmail.mail import Mail
+
+        base = Path(secured_client.app.extra.get("base_dir"))
+        peer = secured_client.app.extra["peer_keyring"]
+        kr = KeyRing(base_dir=base)
+        # sender 'peer' encrypts for US (testagent) using testagent's enc pubkey
+        m = Mail(from_addr="peer@h/peer", to_addr="testagent@localhost", message="top secret")
+        m.encrypt_for(kr.self_enc_public_pem())
+        m.sign(peer)
+        assert m.encrypted
+        resp = secured_client.post("/receive", json=m.to_dict())
+        assert resp.status_code == 200
+        # After receive, the inbox copy should be decrypted cleartext
+        inbox = secured_client.get("/inbox").json()
+        assert inbox["count"] == 1
+        read = secured_client.get("/read", params={"hash": inbox["messages"][0]["short_hash"]}).json()
+        assert read["message"] == "top secret"
+        assert read["encrypted"] in (False, "False")

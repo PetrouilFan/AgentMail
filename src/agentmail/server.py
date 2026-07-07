@@ -16,14 +16,17 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
+from contextlib import asynccontextmanager
+
+from cryptography.hazmat.primitives import serialization
 
 from .mail import Mail, ContentType
 from .config import AgentMailConfig, load_config, resolve_address, init_config_dir
 from .store import MailboxStore
 from .transport import HTTPTransport, SendResult
 from .queue import RetryQueue
+from .crypto import KeyRing
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,8 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
     store = MailboxStore(base_dir=base_dir)
     http_transport = HTTPTransport(config)
     retry_queue = RetryQueue(base_dir=base_dir)
+    keyring = KeyRing(base_dir=base_dir)
+    keyring.ensure()
 
     async def _attempt_send(to: str, mail: Mail) -> SendResult:
         """Try one HTTP delivery; enqueue on failure."""
@@ -102,6 +107,7 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.extra["base_dir"] = base_dir
 
     # ── POST /send ─────────────────────────────────────────────────
 
@@ -148,6 +154,20 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             content_type=ct,
             message=message,
         )
+
+        # Sign with our identity key (if we have one). Encrypt-then-sign so the
+        # signature covers the ciphertext that actually travels on the wire.
+        if keyring.has_identity():
+            # End-to-end encrypt the body if we know the recipient's enc key.
+            recipient_name = (entry.address if entry else to).split("/")[-1]
+            recipient_enc = keyring.known_enc_public(recipient_name)
+            if recipient_enc is not None:
+                recipient_pem = recipient_enc.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                mail.encrypt_for(recipient_pem)
+            mail.sign(keyring)
 
         # Store in local outbox (delivery confirmation)
         store.store_outbox(mail)
@@ -217,10 +237,26 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
         if not mail.verify_hash():
             raise HTTPException(status_code=400, detail="Hash verification failed")
 
+        # Verify the sender's signature (if required by policy).
+        if config.defaults.require_signature and not mail.verify_signature(keyring):
+            raise HTTPException(status_code=403, detail="Signature verification failed")
+
         # Idempotency: drop duplicates (same id) so at-least-once transport
         # semantics don't create duplicate inbox entries.
         if store.inbox_has_id(mail.id):
             return {"status": "duplicate", "mail_hash": mail.short_hash}
+
+        # Decrypt the body locally so the inbox copy is readable by this agent.
+        if mail.encrypted and keyring.has_identity():
+            try:
+                mail.message = mail.decrypt(keyring)
+                mail.encrypted = False
+                mail.ciphertext = mail.nonce = mail.ephemeral_key = ""
+                # Recompute hash over the now-cleartext body so the stored copy
+                # remains self-consistent (verify_hash passes on /read).
+                mail.full_hash = mail._compute_hash()
+            except Exception as e:
+                logger.warning(f"Failed to decrypt incoming mail {mail.short_hash}: {e}")
 
         # Store in inbox
         store.store_inbox(mail)

@@ -29,6 +29,7 @@ class DefaultsConfig(BaseModel):
     retry_backoff: str = "exponential"
     max_retries: int = 5
     archive_after_days: Optional[int] = None
+    require_signature: bool = False
 
 
 class IdentityConfig(BaseModel):
