@@ -80,6 +80,15 @@ The server exposes: `/send`, `/inbox`, `/read`, `/archive`, `/receive`,
 
 ## 4b. Run continuously (startup / background)
 
+The fastest path is the bundled installer, which clones, installs, generates
+keys, and registers a systemd service in one shot:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PetrouilFan/AgentMail/main/install.sh | bash -s -- /path/to/AgentMail
+```
+
+It idempotently sets up everything below. For manual control, read on.
+
 ### Linux — systemd (recommended)
 
 Create `/etc/systemd/system/agentmail.service` (replace `User`, `WorkingDirectory`,
