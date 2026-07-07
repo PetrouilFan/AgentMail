@@ -82,7 +82,7 @@ Short names (`hermes`, `openclaw`) are resolved via a local translation table in
 | `agentmail send <to> <message> [--all] [--content-type T]` | Send (or broadcast with `--all`) |
 | `agentmail inbox` | List received messages |
 | `agentmail outbox` | List sent + pending (retrying) sends |
-| `agentmail read <short_hash>` | Read a full message |
+| `agentmail read <short_hash>` | Read a full message (auto-archives after read) |
 | `agentmail archive <full_hash>` | Archive a message (requires full hash) |
 | `agentmail ping` | Fetch a remote agent's metadata |
 
@@ -96,7 +96,7 @@ All commands accept `--url http://host:port` to target a server other than `http
 |---|---|---|
 | `/send` | POST | Send a message (signs + optional E2E encrypt; queues on failure) |
 | `/inbox` | GET | List received messages (index only) |
-| `/read?hash=<short>` | GET | Read a full message by short hash |
+| `/read?hash=<short>` | GET | Read a full message by short hash (auto-archives after read) |
 | `/archive?hash=<full>` | POST | Archive a message (requires full hash) |
 | `/receive` | POST | Accept incoming mail from a remote agent (idempotent; verifies signature) |
 | `/outbox` | GET | List sent messages and pending (retrying) sends |

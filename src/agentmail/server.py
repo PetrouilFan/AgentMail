@@ -210,10 +210,20 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
 
     @app.get("/read")
     async def read_mail(hash: str = Query(..., description="Short hash (16 chars)")):
-        """Retrieve the full Mail object for a specific message."""
+        """Retrieve the full Mail object for a specific message.
+
+        Auto-archives the message after reading (mailbox-not-chat: read-once
+        semantics). Idempotent — if it's already been read/archived, this is a
+        no-op and the mail is still returned.
+        """
         mail = store.read_inbox(hash)
         if not mail:
             raise HTTPException(status_code=404, detail=f"Message {hash} not found in inbox")
+        # Auto-archive after read so the inbox only holds unread mail.
+        try:
+            store.archive_inbox(mail.full_hash)
+        except Exception:
+            logger.warning(f"Auto-archive failed for {mail.short_hash}")
         return mail.to_dict()
 
     # ── POST /archive ───────────────────────────────────────────────

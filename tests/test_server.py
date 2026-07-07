@@ -182,6 +182,32 @@ class TestReadEndpoint:
         resp = client.get("/read", params={"hash": "0000000000000000"})
         assert resp.status_code == 404
 
+    def test_read_auto_archives(self, client):
+        """Reading a message must remove it from the inbox (read-once)."""
+        from agentmail.mail import Mail, ContentType
+
+        m = Mail(
+            from_addr="peer@h/peer",
+            to_addr="testagent@localhost",
+            content_type=ContentType.TEXT_PLAIN,
+            message="auto-archive me",
+        )
+        rcv = client.post("/receive", json=m.to_dict())
+        assert rcv.status_code == 200
+        inbox = client.get("/inbox").json()
+        assert inbox["count"] == 1
+        short = inbox["messages"][0]["short_hash"]
+
+        read = client.get("/read", params={"hash": short})
+        assert read.status_code == 200
+        assert read.json()["message"] == "auto-archive me"
+
+        # After reading, the inbox must be empty (auto-archived).
+        assert client.get("/inbox").json()["count"] == 0
+
+        # Re-reading the same short hash now 404s (it's no longer in the inbox).
+        assert client.get("/read", params={"hash": short}).status_code == 404
+
 
 class TestPingEndpoint:
     """Test GET /ping."""

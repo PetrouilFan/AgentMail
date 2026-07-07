@@ -181,7 +181,7 @@ agentmail send --all "system restart in 5m"
 
 # Read your inbox and a specific message
 agentmail inbox
-agentmail read <short_hash>
+agentmail read <short_hash>   # reads + auto-archives (read-once: inbox only holds unread)
 
 # Check sent + anything still retrying
 agentmail outbox
