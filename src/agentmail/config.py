@@ -41,11 +41,23 @@ class IdentityConfig(BaseModel):
 
 class TransportConfig(BaseModel):
     """Transport-specific configuration."""
-
     host: str = "0.0.0.0"
     port: int = 8080
     token: str = ""
     router: bool = False
+    tls: bool = False
+
+
+def save_config(config: AgentMailConfig, path: Optional[Path] = None) -> Path:
+    """Persist a config back to YAML.
+
+    Used by the trust command to record newly-discovered peers.
+    """
+    path = path or DEFAULT_CONFIG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_str = yaml.dump(config.model_dump(), default_flow_style=False, sort_keys=False)
+    path.write_text(yaml_str)
+    return path
 
 
 class AgentMailConfig(BaseModel):

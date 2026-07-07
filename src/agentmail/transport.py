@@ -53,10 +53,12 @@ class HTTPTransport(TransportAdapter):
     """HTTP transport adapter — default for LAN/cloud communication.
 
     Sends Mail objects via POST to the target agent's /receive endpoint.
+    Honors a per-transport ``tls`` flag (uses https:// when set).
     """
 
-    def __init__(self, config: AgentMailConfig):
+    def __init__(self, config: AgentMailConfig, tls: bool = False):
         self.config = config
+        self.tls = tls
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -65,17 +67,24 @@ class HTTPTransport(TransportAdapter):
         return self._client
 
     async def send(self, address: str, mail: Mail) -> SendResult:
-        """Send a Mail to an address via HTTP POST."""
-        # Resolve client_id to full address if needed
-        entry = resolve_address(address, self.config)
-        if entry:
-            target = entry.address
-        else:
+        """Send a Mail to an address via HTTP(S) POST.
+
+        If `address` is already a full agentmail address (contains '@'), it is
+        used directly; otherwise it is resolved via the translation table.
+        """
+        # Resolve client_id to full address if needed. A full address
+        # (device@host:port/agent) is passed through unchanged — this lets the
+        # server resolve with its fresh (post-trust) config and avoids a second
+        # lookup against the transport's (possibly stale) startup config.
+        if "@" in address and "/" in address:
             target = address
+        else:
+            entry = resolve_address(address, self.config)
+            target = entry.address if entry else address
 
         # Parse device@host:port/agent into URL
         try:
-            url = self._address_to_url(target)
+            url = self._address_to_url(target, tls=self.tls)
         except ValueError as e:
             return SendResult(success=False, error=str(e))
 
@@ -102,11 +111,11 @@ class HTTPTransport(TransportAdapter):
         pass
 
     @staticmethod
-    def _address_to_url(address: str) -> str:
-        """Convert agentmail address to HTTP URL.
+    def _address_to_url(address: str, tls: bool = False) -> str:
+        """Convert agentmail address to HTTP(S) URL.
 
-        ultron@100.95.112.96:5000/openclaw → http://100.95.112.96:5000
-        gpu-farm@example.com:8080/hermes → http://example.com:8080
+        ultron@100.95.112.96:5000/openclaw → http(s)://100.95.112.96:5000
+        gpu-farm@example.com:8080/hermes     → http(s)://example.com:8080
         """
         if address.startswith("http://") or address.startswith("https://"):
             return address
@@ -120,21 +129,9 @@ class HTTPTransport(TransportAdapter):
         if "/" in host_part:
             host_part = host_part.split("/")[0]
 
-        return f"http://{host_part}"
+        scheme = "https" if tls else "http"
+        return f"{scheme}://{host_part}"
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
-
-
-class StdioTransport(TransportAdapter):
-    """Stdio transport for local process-to-process communication (pipes)."""
-
-    async def send(self, address: str, mail: Mail) -> SendResult:
-        """Stdio transport writes mail JSON to stdout."""
-        logger.info(f"[Stdio] Would send to {address}: {mail.short_hash}")
-        return SendResult(success=True, mail_hash=mail.short_hash)
-
-    async def receive(self, mail: Mail) -> None:
-        """Stdio transport reads from stdin."""
-        pass

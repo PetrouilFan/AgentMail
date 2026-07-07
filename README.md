@@ -17,10 +17,21 @@ agentmail init
 # Generate your signing + encryption identity (creates keys/)
 agentmail keygen
 
-# Exchange public keys with peers (drop their .pub/.xpub into keys/known_agents/)
+# Start your server (use --config to isolate this agent's data)
+agentmail serve --config ~/.agentmail/config.yaml
 
-# Edit config to add agents
-vim ~/.agentmail/config.yaml
+# On another machine / agent, point at this one and establish trust:
+agentmail trust http://this-host:8080 --config /path/to/peer/config.yaml
+# -> imports the peer's keys into your keyring + adds them to your translation table
+
+# Send to a trusted agent (by name) or broadcast to all
+agentmail send hermes "status report attached"
+agentmail send --all "system restart in 5m"
+```
+
+That's the whole loop: **init → keygen → serve → trust → send**. No manual key
+file copying, no restart needed after `trust` (the server re-reads its config
+per send).
 
 # Start the server
 agentmail serve
@@ -148,6 +159,11 @@ src/agentmail/
   - Mail signing (Ed25519 over full_hash) + verification on `/receive` (policy-gated, 403)
   - End-to-end encryption (X25519 + ChaCha20-Poly1305) of the body
   - Local keyring (`known_agents/`), sender encrypts for known recipient, receiver auto-decrypts
-- [ ] **Phase 3 — Multi-Transport** — WebSocket, Telegram, MQTT adapters
-- [ ] **Phase 4 — Structured Data** — JSON schema validation, multi-part messages, binary payloads
-- [ ] **Phase 5 — Discovery & Federation** — mDNS, /ping metadata, cross-server routing
+- [x] **Phase 3 — Operational polish (finalize)** — done
+  - `agentmail trust <url>`: one-command key exchange + translation-table entry (no manual key copy)
+  - `agentmail send --all`: broadcast to every agent in the translation table
+  - `/send` defaults to a routable sender address (`name@host:port/name`) so peers can reply
+  - `/ping` returns real keyring public keys + own address + TLS flag
+  - Server re-reads config per send so `trust` takes effect without restart
+  - HTTP transport honors `tls: true` (https); removed dead Stdio stub
+- [ ] **Future — additional transports** — WebSocket / Telegram / MQTT adapters (pluggable interface already in place)

@@ -44,14 +44,16 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
     """
     config = load_config(config_path)
     store = MailboxStore(base_dir=base_dir)
-    http_transport = HTTPTransport(config)
+    http_conf = config.transports.get("http")
+    tls = bool(http_conf and http_conf.tls)
+    http_transport = HTTPTransport(config, tls=tls)
     retry_queue = RetryQueue(base_dir=base_dir)
     keyring = KeyRing(base_dir=base_dir)
     keyring.ensure()
 
     async def _attempt_send(to: str, mail: Mail) -> SendResult:
         """Try one HTTP delivery; enqueue on failure."""
-        result = await http_transport.send(to, mail)
+        result = await http_transport.send(mail.to_addr, mail)
         if not result.success:
             max_retries = config.defaults.max_retries
             retry_queue.enqueue(mail, error=result.error or "delivery failed", max_retries=max_retries)
@@ -64,10 +66,12 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             await asyncio.sleep(RETRY_POLL_INTERVAL)
             try:
                 due = retry_queue.load_due()
+                # Reload config so max_retries reflects live (post-trust) settings.
+                cfg = load_config(app.extra.get("config_path"))
                 for pending in due:
                     mail = Mail.from_dict(pending.mail)
                     # Skip if we've exhausted retries
-                    if pending.attempts > config.defaults.max_retries:
+                    if pending.attempts > cfg.defaults.max_retries:
                         retry_queue.remove(pending.mail_id)
                         continue
                     result = await http_transport.send(pending.mail_id, mail)
@@ -108,6 +112,7 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
         lifespan=lifespan,
     )
     app.extra["base_dir"] = base_dir
+    app.extra["config_path"] = config_path
 
     # ── POST /send ─────────────────────────────────────────────────
 
@@ -125,8 +130,18 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
         Returns mail_hash on success. On transport failure the message is
         queued for retry with exponential backoff.
         """
-        # Resolve sender identity
-        sender = from_addr or f"{config.identity.name}@localhost"
+        # Re-read config per request so trust/bootstrap updates to the
+        # translation table take effect without a server restart.
+        config_path = app.extra.get("config_path")
+        config = load_config(config_path)
+        # Resolve sender identity — default to a routable address so recipients
+        # can reply (name@host:port/name) rather than an unreachable @localhost.
+        if from_addr:
+            sender = from_addr
+        else:
+            host = (http_conf.host if http_conf and http_conf.host not in ("0.0.0.0",) else "localhost")
+            port = (http_conf.port if http_conf else 8080)
+            sender = f"{config.identity.name}@{host}:{port}/{config.identity.name}"
 
         # Resolve recipient
         entry = resolve_address(to, config)
@@ -291,12 +306,26 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
 
     @app.get("/ping")
     async def ping():
-        """Agent metadata endpoint for discovery."""
+        """Agent metadata endpoint for discovery and trust bootstrap.
+
+        Returns the real keyring public keys (signing + encryption) so peers
+        can establish trust via `agentmail trust <url>` without manual key
+        file exchange.
+        """
+        own_addr = None
+        if http_conf:
+            host = http_conf.host if http_conf.host not in ("0.0.0.0",) else "localhost"
+            own_addr = f"{config.identity.name}@{host}:{http_conf.port}/{config.identity.name}"
+        signing_pub = keyring.self_signing_public_pem().decode("ascii") if keyring.has_identity() else None
+        enc_pub = keyring.self_enc_public_pem().decode("ascii") if keyring.has_identity() else None
         return {
             "name": config.identity.name,
             "version": "0.1.0",
             "transports": list(config.transports.keys()) or ["http"],
-            "public_key": config.identity.public_key or None,
+            "tls": bool(http_conf and http_conf.tls),
+            "address": own_addr,
+            "public_key": signing_pub,
+            "encryption_key": enc_pub,
             "capabilities": [],
         }
 

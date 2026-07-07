@@ -1,15 +1,16 @@
 """AgentMail CLI — manual interaction with the AgentMail server.
 
 Usage:
-    agentmail send <to> <message> [--content-type TYPE] [--from ADDR]
+    agentmail send <to> <message> [--content-type TYPE] [--from ADDR] [--all]
     agentmail inbox
     agentmail outbox
     agentmail read <short_hash>
     agentmail archive <full_hash>
     agentmail ping
+    agentmail trust <url>                — exchange keys with a peer + add to table
     agentmail init                         — initialize config directory
     agentmail keygen [--overwrite]         — generate local signing + encryption keys
-    agentmail serve [--host HOST] [--port PORT]
+    agentmail serve [--host HOST] [--port PORT] [--config PATH]
 """
 
 from __future__ import annotations
@@ -32,30 +33,54 @@ def _base_url(args: argparse.Namespace) -> str:
 
 
 def cmd_send(args: argparse.Namespace) -> None:
-    """Send a message to an agent."""
+    """Send a message to an agent (or broadcast with --all)."""
     url = _base_url(args)
+    if getattr(args, "all", False):
+        # Broadcast to every agent in the translation table.
+        from .config import load_config, DEFAULT_CONFIG_PATH
+        cfg_path = Path(args.config) if getattr(args, "config", None) else DEFAULT_CONFIG_PATH
+        config = load_config(cfg_path)
+        if not config.agents:
+            print("No agents in translation table. Add one with `agentmail trust <url>`.")
+            sys.exit(1)
+        ok = 0
+        for name in config.agents:
+            r = _do_send(url, name, args.message, args.content_type, args.from_addr)
+            if r[0]:
+                ok += 1
+                print(f"✓ Sent to {name}")
+            else:
+                print(f"⏳ Queued (will retry): {name} — {r[1]}")
+        print(f"\nBroadcast complete: {ok}/{len(config.agents)} delivered immediately.")
+        return
+    if not args.to or not args.message:
+        print("Error: 'to' and 'message' are required unless using --all")
+        sys.exit(1)
+    status, err = _do_send(url, args.to, args.message, args.content_type, args.from_addr)
+    if err and not status:
+        print(f"⏳ Queued (delivery failed, will retry): {args.to}")
+        print(f"  ⚠ Transport error: {err}")
+    else:
+        print(f"✓ Sent to {args.to}")
+    print(f"  (see /outbox for mail_hash)")
+
+
+def _do_send(url: str, to: str, message: str, content_type: str, from_addr: str | None):
+    """Send one message; return (success, error)."""
     with httpx.Client(timeout=30.0) as client:
         resp = client.post(
             f"{url}/send",
             params={
-                "to": args.to,
-                "message": args.message,
-                "content_type": args.content_type,
-                "from_addr": args.from_addr,
+                "to": to,
+                "message": message,
+                "content_type": content_type,
+                "from_addr": from_addr,
             },
         )
         if resp.status_code != 200:
-            print(f"Error: {resp.status_code} — {resp.text}")
-            sys.exit(1)
+            return False, f"HTTP {resp.status_code}: {resp.text}"
         data = resp.json()
-        if data.get("error"):
-            print(f"⏳ Queued (delivery failed, will retry): {data['to']}")
-        else:
-            print(f"✓ Sent to {data['to']}")
-        print(f"  mail_hash: {data['mail_hash']}")
-        print(f"  full_hash: {data['full_hash']}")
-        if data.get("error"):
-            print(f"  ⚠ Transport error: {data['error']}")
+        return (not data.get("error")), data.get("error", "")
 
 
 def cmd_inbox(args: argparse.Namespace) -> None:
@@ -120,7 +145,7 @@ def cmd_read(args: argparse.Namespace) -> None:
         print(f"To:             {data['to']}")
         print(f"At:             {data['at']}")
         print(f"ID:             {data['id']}")
-        print(f"Content-Type:   {data.get('content-type', 'text/plain')}")
+        print(f"Content-Type:   {data.get('content_type', 'text/plain')}")
         print(f"Hash:           {data['full_hash'][:16]}... ({len(data['full_hash'])} chars)")
         print()
         print(data["message"])
@@ -150,8 +175,55 @@ def cmd_ping(args: argparse.Namespace) -> None:
         print(f"Name:          {data.get('name', 'unknown')}")
         print(f"Version:       {data.get('version', '?')}")
         print(f"Transports:    {', '.join(data.get('transports', []))}")
-        print(f"Public Key:    {data.get('public_key', 'none')}")
+        print(f"TLS:           {data.get('tls', False)}")
+        print(f"Address:       {data.get('address', 'unknown')}")
+        print(f"Public Key:    {data.get('public_key', 'none')[:40]}…" if data.get("public_key") else "Public Key:    none")
         print(f"Capabilities:  {', '.join(data.get('capabilities', [])) or 'none'}")
+
+
+def cmd_trust(args: argparse.Namespace) -> None:
+    """Establish trust with a remote agent: import its keys + add to table.
+
+    Pings the peer, writes its signing/encryption public keys into our
+    known_agents/ keyring, and records the peer in our translation table so we
+    can address it by name. This replaces manual .pub/.xpub file exchange.
+    """
+    from .crypto import KeyRing
+    from .config import load_config, save_config, AgentEntry, DEFAULT_CONFIG_PATH
+
+    url = _base_url(args)
+    peer = args.url.rstrip("/") if args.url else url
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.get(f"{url}/ping")
+        if resp.status_code != 200:
+            print(f"Error: {resp.status_code} — {resp.text}")
+            sys.exit(1)
+        meta = resp.json()
+
+    name = meta.get("name")
+    if not name:
+        print("Error: peer returned no name")
+        sys.exit(1)
+    signing_pub = meta.get("public_key")
+    enc_pub = meta.get("encryption_key")
+    if not signing_pub or not enc_pub:
+        print("Error: peer has no identity keys (ask them to run `agentmail keygen`)")
+        sys.exit(1)
+
+    cfg_path = Path(args.config) if getattr(args, "config", None) else DEFAULT_CONFIG_PATH
+    # Keyring root follows the config dir's parent — same as the server's base_dir.
+    kr = KeyRing(base_dir=cfg_path.parent)
+    kr.add_known_agent(name, signing_pub.encode("ascii"), enc_pub.encode("ascii"))
+    print(f"✓ Trusted {name}: imported signing + encryption keys")
+
+    # Record the peer in our translation table.
+    cfg_path = Path(args.config) if getattr(args, "config", None) else DEFAULT_CONFIG_PATH
+    config = load_config(cfg_path)
+    address = meta.get("address") or f"{name}@{url.split('://')[-1].split('/')[0]}/{name}"
+    transport = "https" if meta.get("tls") else "http"
+    config.agents[name] = AgentEntry(address=address, transport=transport, public_key=signing_pub)
+    save_config(config, cfg_path)
+    print(f"✓ Added '{name}' to translation table → {address} ({transport})")
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -165,7 +237,10 @@ def cmd_keygen(args: argparse.Namespace) -> None:
     """Generate or regenerate the local cryptographic identity."""
     from .crypto import KeyRing
 
-    kr = KeyRing()
+    # Keyring root follows --config's parent (or default ~/.agentmail), so keys
+    # land where the server (which uses base_dir = config.parent) will read them.
+    cfg_path = Path(args.config) if getattr(args, "config", None) else DEFAULT_CONFIG_PATH
+    kr = KeyRing(base_dir=cfg_path.parent)
     existed = kr.has_identity()
     kr.generate(overwrite=args.overwrite)
     print(f"✓ {'Regenerated' if existed and args.overwrite else 'Generated'} identity at {kr.keys_dir}")
@@ -212,10 +287,12 @@ def main() -> None:
 
     # send
     p_send = sub.add_parser("send", help="Send a message to an agent")
-    p_send.add_argument("to", help="Recipient agent ID or full address")
+    p_send.add_argument("to", nargs="?", help="Recipient agent ID or full address (omit with --all)")
     p_send.add_argument("message", help="Message body")
     p_send.add_argument("--content-type", default="text/plain", help="Content type")
     p_send.add_argument("--from-addr", default=None, dest="from_addr", help="Sender address")
+    p_send.add_argument("--all", action="store_true", help="Broadcast to all agents in translation table")
+    p_send.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file with translation table")
 
     # inbox
     sub.add_parser("inbox", help="List messages in inbox")
@@ -234,12 +311,18 @@ def main() -> None:
     # ping
     sub.add_parser("ping", help="Ping a remote agent for metadata")
 
+    # trust
+    p_trust = sub.add_parser("trust", help="Establish trust with a remote agent (exchange keys + add to table)")
+    p_trust.add_argument("url", help="Base URL of the agent to trust (e.g. http://host:8080)")
+    p_trust.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file to update")
+
     # init
     sub.add_parser("init", help="Initialize config directory")
 
     # keygen
     p_keygen = sub.add_parser("keygen", help="Generate local signing + encryption keys")
     p_keygen.add_argument("--overwrite", action="store_true", help="Overwrite existing keys")
+    p_keygen.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config dir parent for keyring")
 
     # serve
     p_serve = sub.add_parser("serve", help="Start the AgentMail server")
@@ -256,6 +339,7 @@ def main() -> None:
         "read": cmd_read,
         "archive": cmd_archive,
         "ping": cmd_ping,
+        "trust": cmd_trust,
         "init": cmd_init,
         "keygen": cmd_keygen,
         "serve": cmd_serve,
