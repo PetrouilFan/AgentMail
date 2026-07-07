@@ -3,6 +3,7 @@
 Usage:
     agentmail send <to> <message> [--content-type TYPE] [--from ADDR]
     agentmail inbox
+    agentmail outbox
     agentmail read <short_hash>
     agentmail archive <full_hash>
     agentmail ping
@@ -46,7 +47,10 @@ def cmd_send(args: argparse.Namespace) -> None:
             print(f"Error: {resp.status_code} — {resp.text}")
             sys.exit(1)
         data = resp.json()
-        print(f"✓ Sent to {data['to']}")
+        if data.get("error"):
+            print(f"⏳ Queued (delivery failed, will retry): {data['to']}")
+        else:
+            print(f"✓ Sent to {data['to']}")
         print(f"  mail_hash: {data['mail_hash']}")
         print(f"  full_hash: {data['full_hash']}")
         if data.get("error"):
@@ -70,6 +74,36 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         print("-" * 64)
         for i, msg in enumerate(data["messages"]):
             print(f"{i:<4} {msg['from']:<40} {msg['short_hash']:<20}")
+
+
+def cmd_outbox(args: argparse.Namespace) -> None:
+    """List sent messages and pending (retrying) sends."""
+    url = _base_url(args)
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(f"{url}/outbox")
+        if resp.status_code != 200:
+            print(f"Error: {resp.status_code} — {resp.text}")
+            sys.exit(1)
+        data = resp.json()
+        if data["sent_count"] == 0 and data["pending_count"] == 0:
+            print("Outbox is empty.")
+            return
+        if data["sent_count"]:
+            print(f"Sent ({data['sent_count']}):")
+            print(f"{'#':<4} {'To':<40} {'Hash':<20}")
+            print("-" * 64)
+            for i, msg in enumerate(data["sent"]):
+                print(f"{i:<4} {msg['to']:<40} {msg['short_hash']:<20}")
+        if data["pending_count"]:
+            print()
+            print(f"Pending retry ({data['pending_count']}):")
+            print(f"{'#':<4} {'To':<36} {'Hash':<18} {'Attempts':<9} Next")
+            print("-" * 78)
+            for i, p in enumerate(data["pending"]):
+                print(
+                    f"{i:<4} {p['to']:<36} {p['short_hash']:<18} "
+                    f"{p['attempts']:<9} {p['next_attempt']}"
+                )
 
 
 def cmd_read(args: argparse.Namespace) -> None:
@@ -167,6 +201,9 @@ def main() -> None:
     # inbox
     sub.add_parser("inbox", help="List messages in inbox")
 
+    # outbox
+    sub.add_parser("outbox", help="List sent messages and pending retries")
+
     # read
     p_read = sub.add_parser("read", help="Read a message by short hash")
     p_read.add_argument("hash", help="Short hash (16 chars)")
@@ -192,6 +229,7 @@ def main() -> None:
     commands = {
         "send": cmd_send,
         "inbox": cmd_inbox,
+        "outbox": cmd_outbox,
         "read": cmd_read,
         "archive": cmd_archive,
         "ping": cmd_ping,

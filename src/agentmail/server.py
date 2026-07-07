@@ -1,42 +1,99 @@
-"""AgentMail server — FastAPI application with 4 core endpoints.
+"""AgentMail server — FastAPI application with the 4 core endpoints.
 
 POST /send    — Send a message to an agent
 GET  /inbox  — List received messages (index only)
 GET  /read   — Read a full message by short hash
 POST /archive — Move a message from inbox to archive
+POST /receive — Accept incoming Mail from a remote agent
+GET  /outbox — List locally queued (pending/sent) messages
+GET  /ping   — Agent metadata for discovery
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
 from contextlib import asynccontextmanager
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query
 
 from .mail import Mail, ContentType
 from .config import AgentMailConfig, load_config, resolve_address, init_config_dir
 from .store import MailboxStore
 from .transport import HTTPTransport, SendResult
+from .queue import RetryQueue
 
 logger = logging.getLogger(__name__)
 
+# How often the background retry worker wakes to check for due sends.
+RETRY_POLL_INTERVAL = 5.0
 
-def create_app(config_path: Optional[Path] = None) -> FastAPI:
-    """Create and configure the AgentMail FastAPI application."""
+
+def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = None) -> FastAPI:
+    """Create and configure the AgentMail FastAPI application.
+
+    Args:
+        config_path: Explicit config.yaml path. Defaults to ~/.agentmail/config.yaml.
+        base_dir: Mailbox/queue root. Defaults to ~/.agentmail. Tests pass a
+            temporary directory here to isolate filesystem state.
+    """
     config = load_config(config_path)
-    store = MailboxStore()
+    store = MailboxStore(base_dir=base_dir)
     http_transport = HTTPTransport(config)
+    retry_queue = RetryQueue(base_dir=base_dir)
+
+    async def _attempt_send(to: str, mail: Mail) -> SendResult:
+        """Try one HTTP delivery; enqueue on failure."""
+        result = await http_transport.send(to, mail)
+        if not result.success:
+            max_retries = config.defaults.max_retries
+            retry_queue.enqueue(mail, error=result.error or "delivery failed", max_retries=max_retries)
+            logger.warning(f"Send failed for {to}: {result.error} — queued for retry")
+        return result
+
+    async def _retry_worker() -> None:
+        """Background loop: retry any due pending sends with backoff."""
+        while True:
+            await asyncio.sleep(RETRY_POLL_INTERVAL)
+            try:
+                due = retry_queue.load_due()
+                for pending in due:
+                    mail = Mail.from_dict(pending.mail)
+                    # Skip if we've exhausted retries
+                    if pending.attempts > config.defaults.max_retries:
+                        retry_queue.remove(pending.mail_id)
+                        continue
+                    result = await http_transport.send(pending.mail_id, mail)
+                    if result.success:
+                        retry_queue.remove(pending.mail_id)
+                        logger.info(f"Retry delivered {mail.short_hash} to {mail.to_addr}")
+                    else:
+                        retry_queue.reschedule(pending, error=result.error or "retry failed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # never let the worker die
+                logger.exception(f"Retry worker error: {e}")
 
     # ── Lifespan ────────────────────────────────────────────────────
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        init_config_dir()
-        logger.info(f"AgentMail server started — identity: {config.identity.name}")
+        init_config_dir(base_dir)
+        # Re-enqueue any pending sends that survived a restart.
+        pending = retry_queue.list_pending()
+        if pending:
+            logger.info(f"AgentMail started — {len(pending)} pending send(s) in retry queue")
+        else:
+            logger.info(f"AgentMail server started — identity: {config.identity.name}")
+        worker = asyncio.create_task(_retry_worker())
         yield
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
         await http_transport.close()
 
     app = FastAPI(
@@ -59,7 +116,8 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
 
         The server resolves `to` via the translation table, routes to
         the appropriate transport, and stores a copy in the local outbox.
-        Returns mail_hash on success.
+        Returns mail_hash on success. On transport failure the message is
+        queued for retry with exponential backoff.
         """
         # Resolve sender identity
         sender = from_addr or f"{config.identity.name}@localhost"
@@ -72,11 +130,16 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
                 detail=f"Agent '{to}' not found in translation table and not a full address",
             )
 
-        # Validate content type
+        # Validate content type strictly — reject unknown types instead of
+        # silently downgrading to text/plain.
         try:
             ct = ContentType(content_type)
         except ValueError:
-            ct = ContentType.TEXT_PLAIN
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported content-type '{content_type}'. "
+                f"Supported: {[c.value for c in ContentType]}",
+            )
 
         # Create the Mail object
         mail = Mail(
@@ -86,15 +149,11 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
             message=message,
         )
 
-        # Store in local outbox
+        # Store in local outbox (delivery confirmation)
         store.store_outbox(mail)
 
-        # Send via transport
-        result: SendResult = await http_transport.send(to, mail)
-
-        if not result.success:
-            logger.warning(f"Send failed for {to}: {result.error}")
-            # Still return partial success — message is stored locally
+        # Attempt delivery
+        result = await _attempt_send(to, mail)
 
         return {
             "status": "sent" if result.success else "queued",
@@ -145,7 +204,9 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         """Accept an incoming Mail from a remote agent.
 
         This is the endpoint that other agents POST to when sending
-        messages to this server.
+        messages to this server. Delivery is at-least-once, so idempotency
+        is enforced here by the Mail's UUID — a duplicate is acknowledged
+        without re-storing.
         """
         try:
             mail = Mail.from_dict(mail_data)
@@ -156,10 +217,39 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         if not mail.verify_hash():
             raise HTTPException(status_code=400, detail="Hash verification failed")
 
+        # Idempotency: drop duplicates (same id) so at-least-once transport
+        # semantics don't create duplicate inbox entries.
+        if store.inbox_has_id(mail.id):
+            return {"status": "duplicate", "mail_hash": mail.short_hash}
+
         # Store in inbox
         store.store_inbox(mail)
 
         return {"status": "received", "mail_hash": mail.short_hash}
+
+    # ── GET /outbox ─────────────────────────────────────────────────
+
+    @app.get("/outbox")
+    async def list_outbox():
+        """List locally stored outbox messages and pending (retrying) sends."""
+        sent = store.list_outbox()
+        pending = [
+            {
+                "mail_id": p.mail_id,
+                "short_hash": p.full_hash[:16],
+                "to": p.mail.get("to", ""),
+                "attempts": p.attempts,
+                "next_attempt": p.next_attempt.isoformat(),
+                "last_error": p.last_error,
+            }
+            for p in retry_queue.list_pending()
+        ]
+        return {
+            "sent_count": len(sent),
+            "pending_count": len(pending),
+            "sent": sent,
+            "pending": pending,
+        }
 
     # ── GET /ping ───────────────────────────────────────────────────
 

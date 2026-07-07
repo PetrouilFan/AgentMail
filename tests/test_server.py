@@ -10,14 +10,14 @@ from agentmail.server import create_app
 
 @pytest.fixture
 def client(tmp_path):
-    """Create a test client with an isolated config directory."""
+    """Create a test client with an isolated config and mailbox directory."""
     config_file = tmp_path / "config.yaml"
     # Write a minimal config
     config_file.write_text(
         "identity:\n  name: testagent\n  public_key: ''\n"
         "transports: {}\nagents: {}\ndefaults:\n  content_type: text/plain\n"
     )
-    app = create_app(config_path=config_file)
+    app = create_app(config_path=config_file, base_dir=tmp_path)
     return TestClient(app)
 
 
@@ -104,6 +104,75 @@ class TestReceiveEndpoint:
     def test_receive_invalid_data(self, client):
         resp = client.post("/receive", json={"garbage": True})
         assert resp.status_code == 400
+
+
+class TestReceiveIdempotency:
+    """POST /receive must be idempotent under at-least-once delivery."""
+
+    def test_duplicate_receive_does_not_double_store(self, client):
+        from agentmail.mail import Mail
+
+        mail = Mail(from_addr="f@h/f", to_addr="testagent@localhost", message="dup")
+        r1 = client.post("/receive", json=mail.to_dict())
+        assert r1.status_code == 200
+        assert r1.json()["status"] == "received"
+
+        inbox_after_first = client.get("/inbox").json()["count"]
+
+        r2 = client.post("/receive", json=mail.to_dict())
+        assert r2.status_code == 200
+        assert r2.json()["status"] == "duplicate"
+
+        inbox_after_second = client.get("/inbox").json()["count"]
+        assert inbox_after_second == inbox_after_first == 1
+
+
+class TestContentTypeValidation:
+    """POST /send must reject unknown content-types with 400."""
+
+    def test_unknown_content_type_rejected(self, client):
+        resp = client.post(
+            "/send",
+            params={"to": "bob@10.0.0.2:8080/bob", "message": "x", "content_type": "image/png"},
+        )
+        assert resp.status_code == 400
+        assert "Unsupported content-type" in resp.json()["detail"]
+
+    def test_known_content_type_accepted(self, client):
+        resp = client.post(
+            "/send",
+            params={
+                "to": "bob@10.0.0.2:8080/bob",
+                "message": "json",
+                "content_type": "application/json",
+            },
+        )
+        # Stored locally + queued (no live server) → 200
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "queued"
+
+
+class TestOutboxEndpoint:
+    """GET /outbox surfaces sent + pending (retrying) sends."""
+
+    def test_outbox_after_queued_send(self, client):
+        client.post("/send", params={"to": "bob@10.0.0.2:8080/bob", "message": "hello"})
+        resp = client.get("/outbox")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sent_count"] == 1
+        assert data["pending_count"] == 1
+        assert data["sent"][0]["to"] == "bob@10.0.0.2:8080/bob"
+        assert data["pending"][0]["attempts"] == 1
+
+    def test_outbox_empty(self, client):
+        resp = client.get("/outbox")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sent_count"] == 0
+        assert data["pending_count"] == 0
+
 
 
 class TestReadEndpoint:

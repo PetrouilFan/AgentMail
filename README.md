@@ -26,6 +26,9 @@ agentmail send bob@10.0.0.2:8080/bob "Hello from AgentMail"
 # Check your inbox
 agentmail inbox
 
+# Check sent + pending (retrying) messages
+agentmail outbox
+
 # Read a message
 agentmail read a1b2c3d4e5f67890
 
@@ -57,7 +60,8 @@ Short names are resolved via a local translation table in `~/.agentmail/config.y
 | `/inbox` | GET | List received messages (index only) |
 | `/read?hash=<short>` | GET | Read a full message by short hash |
 | `/archive?hash=<full>` | POST | Archive a message (requires full hash) |
-| `/receive` | POST | Accept incoming mail from a remote agent |
+| `/receive` | POST | Accept incoming mail from a remote agent (idempotent) |
+| `/outbox` | GET | List sent messages and pending (retrying) sends |
 | `/ping` | GET | Agent metadata for discovery |
 
 ## Mail Object
@@ -100,14 +104,15 @@ defaults:
 
 ## Project Structure
 
-```
+```bash
 src/agentmail/
 ├── __init__.py       # Package init
 ├── mail.py           # Mail object model (dataclass + hashing)
 ├── config.py         # Translation table & YAML config
 ├── store.py          # File-based mailbox storage
 ├── transport.py      # Transport adapter interface + HTTP adapter
-├── server.py         # FastAPI application (4 core endpoints)
+├── queue.py          # Persistent retry queue (exponential backoff)
+├── server.py         # FastAPI application (core + receive/outbox/ping)
 └── cli.py            # CLI client
 ```
 
@@ -121,7 +126,7 @@ src/agentmail/
 
 ## Implementation Roadmap
 
-- [x] **Phase 1 — Core (MVP)** ← You are here
+- [x] **Phase 1 — Core (MVP)** — done
   - Mail object definition and serialization
   - Local translation table (YAML config)
   - HTTP transport adapter
@@ -129,6 +134,9 @@ src/agentmail/
   - Hash-based indexing
   - File-based mailbox storage
   - CLI client
+  - Inbound `/receive` (idempotent) + `/outbox` + `/ping` endpoints
+  - Persistent retry queue with exponential backoff
+  - Strict content-type validation
 - [ ] **Phase 2 — Identity & Security** — Ed25519 signing, X25519+ChaCha20 encryption, local keyring
 - [ ] **Phase 3 — Multi-Transport** — WebSocket, Telegram, MQTT adapters
 - [ ] **Phase 4 — Structured Data** — JSON schema validation, multi-part messages, binary payloads

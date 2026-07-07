@@ -64,6 +64,20 @@ class MailboxStore:
         data = json.loads(path.read_text())
         return Mail.from_dict(data)
 
+    def inbox_has_id(self, mail_id: str) -> bool:
+        """Check whether a Mail with the given UUID is already in the inbox.
+
+        Used to guarantee at-least-once delivery idempotency on /receive.
+        """
+        for path in self.inbox_dir.glob("*.mail"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("id") == mail_id:
+                return True
+        return False
+
     def archive_inbox(self, full_hash: str) -> Optional[Path]:
         """Move a Mail from inbox to archive. Requires the full hash.
 
