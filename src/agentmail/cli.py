@@ -192,7 +192,6 @@ def cmd_trust(args: argparse.Namespace) -> None:
     from .config import load_config, save_config, AgentEntry, DEFAULT_CONFIG_PATH
 
     url = _base_url(args)
-    peer = args.url.rstrip("/") if args.url else url
     with httpx.Client(timeout=10.0) as client:
         resp = client.get(f"{url}/ping")
         if resp.status_code != 200:

@@ -60,7 +60,7 @@ identity:
   name: $(hostname -s)
 transports:
   http:
-    host: 0.0.0.0
+    host: $BIND_HOST
     port: $PORT
 agents: {}
 defaults:
@@ -68,6 +68,22 @@ defaults:
   require_signature: false
 YAML
 fi
+
+# Detect a routable bind host: prefer the Tailscale IP (so peers on the
+# tailnet can reply), else the primary non-loopback LAN IP. Avoid 0.0.0.0 in
+# the config's `host:` — /send rewrites 0.0.0.0 to "localhost", which peers
+# cannot reply to.
+detect_host() {
+  # Tailscale IP (100.x.y.z)
+  local ts
+  ts=$(ip -4 addr show 2>/dev/null | awk '/inet 100\./{print $2}' | cut -d/ -f1 | head -1)
+  [ -n "$ts" ] && { echo "$ts"; return; }
+  # otherwise first non-loopback, non-docker/zero-conf IP
+  ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^(127\.|172\.1[678]\.)/{print $2}' \
+    | cut -d/ -f1 | grep -v '^169\.254\.' | head -1
+}
+BIND_HOST="$(detect_host)"
+[ -z "$BIND_HOST" ] && BIND_HOST="0.0.0.0"
 
 BIN="$INSTALL_DIR/.venv/bin/agentmail"
 
@@ -85,7 +101,7 @@ Wants=network-online.target
 Type=simple
 User=$USER
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$BIN serve --host 0.0.0.0 --port $PORT --config $INSTALL_DIR/config.yaml
+ExecStart=$BIN serve --host $BIND_HOST --port $PORT --config $INSTALL_DIR/config.yaml
 Restart=always
 RestartSec=3
 
@@ -99,7 +115,7 @@ EOF
 else
   echo "==> no systemd; starting under tmux (survives terminal close, not reboot)"
   command -v tmux >/dev/null 2>&1 || { echo "ERROR: tmux not found and no systemd. Install tmux or run 'uv run agentmail serve' manually." >&2; exit 1; }
-  tmux new -s agentmail -d "$BIN serve --host 0.0.0.0 --port $PORT --config $INSTALL_DIR/config.yaml"
+  tmux new -s agentmail -d "$BIN serve --host $BIND_HOST --port $PORT --config $INSTALL_DIR/config.yaml"
   sleep 2
   tmux capture-pane -t agentmail -p | tail -5
 fi
