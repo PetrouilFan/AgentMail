@@ -213,7 +213,11 @@ def _cli() -> None:
 
     cfg_path = Path(args.config)
     if args.once:
-        handled, stop = run_once(url, cfg_path, default_dispatch)
+        try:
+            handled, stop = run_once(url, cfg_path, default_dispatch)
+        except Exception as e:
+            print(f"[once] sweep failed: {e}")
+            sys.exit(1)
         print(f"one-shot: handled {handled}, stop={stop}")
         sys.exit(0)
     main_loop(cfg_path, base_url=url, poll=poll, max_iters=max_iters)

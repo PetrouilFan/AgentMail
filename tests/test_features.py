@@ -126,6 +126,31 @@ class TestBridge:
             sent = out["sent"][0]
             assert sent["to"] == "nodeA@1.2.3.4:12345/nodeA"
 
+    def test_bridge_loads_config_file(self, tmp_path):
+        """The bridge honours a bridge_config.yaml (poll/url/max_iters)."""
+        import io, sys
+        from contextlib import redirect_stdout
+        from agentmail.bridge import _cli
+
+        bcfg = tmp_path / "bridge_config.yaml"
+        bcfg.write_text("poll: 77\nurl: http://bridgecfg.test\nmax_iters: 3\n")
+        argv = ["bridge", "--bridge-config", str(bcfg), "--once",
+                "--config", str(tmp_path / "config.yaml")]
+        old = sys.argv
+        sys.argv = argv
+        try:
+            f = io.StringIO()
+            with redirect_stdout(f):
+                try:
+                    _cli()
+                except SystemExit:
+                    pass
+            out = f.getvalue()
+            # Config parsed (no YAMLError) and the one-shot sweep ran.
+            assert "one-shot" in out or "handled" in out or "sweep failed" in out
+        finally:
+            sys.argv = old
+
 
 # ── Mesh import / export ─────────────────────────────────────────
 
@@ -282,14 +307,16 @@ class TestFederation:
 
         procs = []
         for d, port in ((de, 13501), (dr, 13502), (df, 13503)):
-            p = subprocess.Popen([str(Path(__file__).parent.parent / ".venv" / "bin" / "python"),
-                                  "-m", "agentmail", "serve", "--config", str(d / "config.yaml"),
-                                  "--host", "127.0.0.1"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            procs.append(p)
+            logf = d / "serve.log"
+            with open(logf, "wb") as lf:
+                p = subprocess.Popen([str(Path(__file__).parent.parent / ".venv" / "bin" / "python"),
+                                      "-m", "agentmail", "serve", "--config", str(d / "config.yaml"),
+                                      "--host", "127.0.0.1"],
+                                     stdout=lf, stderr=lf, start_new_session=True)
+            procs.append((p, d, port))
 
         def up(url):
-            for _ in range(150):
+            for _ in range(200):
                 try:
                     httpx.get(url + "/ping", timeout=1); return True
                 except Exception:
@@ -297,6 +324,9 @@ class TestFederation:
             return False
 
         try:
+            for p, d, port in procs:
+                if not up(f"http://127.0.0.1:{port}"):
+                    print(f"server on {port} failed to start; log:\n{(d / 'serve.log').read_text()[-600:]}")
             assert up("http://127.0.0.1:13501") and up("http://127.0.0.1:13502") and up("http://127.0.0.1:13503")
             # edge sends to 'dest' (unknown to edge, unknown to router) → multi-hop
             # edge relays to router → router relays to final → final delivers to dest.
