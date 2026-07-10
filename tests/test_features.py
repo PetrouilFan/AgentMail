@@ -215,12 +215,16 @@ class TestFederation:
         )
         app = create_app(config_path=cfg, base_dir=tmp_path)
         with TestClient(app) as client:
-            r = client.post("/send", params={"to": "ghost@9.9.9.9:12345/ghost", "message": "hi"})
-            # No federation, unknown agent → 404.
+            # No federation, unknown agent → 404 (refused instantly on :1).
+            r = client.post("/send", params={"to": "ghost@127.0.0.1:1/ghost", "message": "hi"})
             assert r.status_code == 404
 
-    def test_federation_status_field(self, tmp_path):
-        """Confirm the federation flag is honored (status 'federated' when on)."""
+    def test_federation_relays_to_router(self, tmp_path):
+        """With federation on, an unknown recipient is relayed to a known router.
+
+        The router address points at a closed port (127.0.0.1:1) so the relay
+        fails fast (connection refused) without hanging on a timeout.
+        """
         from fastapi.testclient import TestClient
         from agentmail.server import create_app
 
@@ -230,14 +234,16 @@ class TestFederation:
         cfg = tmp_path / "config.yaml"
         cfg.write_text(
             "identity:\n  name: router\n  public_key: ''\n"
-            "transports: {}\nagents:\n  peer:\n    address: peer@127.0.0.1:9999/peer\n"
+            "transports: {}\nagents:\n  peer:\n    address: peer@127.0.0.1:1/peer\n"
             "    transport: http\n    public_key: ''\ndefaults:\n  content_type: text/plain\n"
             "  federation: true\n"
         )
         app = create_app(config_path=cfg, base_dir=base)
         with TestClient(app) as client:
-            # peer is unreachable → federation relay attempts; returns 'federated'
-            # only if a router accepted. peer won't, so it should fall through to 404.
-            r = client.post("/send", params={"to": "ghost@9.9.9.9:12345/ghost", "message": "hi"})
-            # peer@127.0.0.1:9999 is unreachable → relay fails → 404.
+            r = client.post("/send", params={"to": "ghost@127.0.0.1:1/ghost", "message": "hi"})
+            # peer@127.0.0.1:1 refuses instantly → relay fails → 404.
             assert r.status_code == 404
+
+    def test_federation_flag_present_in_defaults(self):
+        cfg = AgentMailConfig()
+        assert cfg.defaults.federation is False
