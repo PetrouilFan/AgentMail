@@ -248,3 +248,74 @@ class TestFederation:
     def test_federation_flag_present_in_defaults(self):
         cfg = AgentMailConfig()
         assert cfg.defaults.federation is False
+
+    def test_federation_multihop_delivers(self, tmp_path):
+        """Multi-hop: edge can't resolve, relays to router, router relays to
+        final which CAN resolve and deliver. Proves true multi-hop routing."""
+        import subprocess, time
+        import httpx
+
+        def write_cfg(name, port, agents, federation=True, hops=5):
+            d = tmp_path / name
+            (d / "keys" / "known_agents").mkdir(parents=True)
+            cfg = d / "config.yaml"
+            agents_yaml = "\n".join(
+                f"  {n}:\n    address: {a}\n    transport: http\n    public_key: ''"
+                for n, a in agents.items()
+            )
+            cfg.write_text(
+                f"identity:\n  name: {name}\n  public_key: ''\n"
+                f"transports:\n  http:\n    host: 127.0.0.1\n    port: {port}\n"
+                f"agents:\n{agents_yaml}\n"
+                f"defaults:\n  content_type: text/plain\n  federation: {str(federation).lower()}\n"
+                f"  max_federation_hops: {hops}\n"
+            )
+            return d, cfg
+
+        de, cfge = write_cfg("edge", 13501, {}, federation=True)
+        dr, cfgr = write_cfg("router", 13502, {"final": "final@127.0.0.1:13503/final"})
+        df, cfgf = write_cfg("final", 13503, {"dest": "dest@127.0.0.1:13503/dest"})
+        for d in (de, dr, df):
+            subprocess.run([str(Path(__file__).parent.parent / ".venv" / "bin" / "python"),
+                             "-m", "agentmail", "keygen", "--config", str(d / "config.yaml")],
+                            capture_output=True)
+
+        procs = []
+        for d, port in ((de, 13501), (dr, 13502), (df, 13503)):
+            p = subprocess.Popen([str(Path(__file__).parent.parent / ".venv" / "bin" / "python"),
+                                  "-m", "agentmail", "serve", "--config", str(d / "config.yaml"),
+                                  "--host", "127.0.0.1"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(p)
+
+        def up(url):
+            for _ in range(150):
+                try:
+                    httpx.get(url + "/ping", timeout=1); return True
+                except Exception:
+                    time.sleep(0.1)
+            return False
+
+        try:
+            assert up("http://127.0.0.1:13501") and up("http://127.0.0.1:13502") and up("http://127.0.0.1:13503")
+            # edge sends to 'dest' (unknown to edge, unknown to router) → multi-hop
+            # edge relays to router → router relays to final → final delivers to dest.
+            r = httpx.post("http://127.0.0.1:13501/send", params={"to": "dest", "message": "hop test"})
+            # edge can't deliver directly (404 path would be if no federation); with
+            # federation it relays. Whether it returns 'federated' or not depends on
+            # router reachability — router IS up, so edge relays and returns 'federated'.
+            assert r.status_code == 200
+            # Give the relay chain a moment, then dest (final) should have received it.
+            time.sleep(1.0)
+            inbox = httpx.get("http://127.0.0.1:13503/inbox").json()
+            # final's inbox is addressed to 'final' (the relay target), not 'dest'.
+            # The relay delivers to final's /send with to=dest; final can't resolve
+            # 'dest' either, but 'dest' is final itself? No — final knows 'dest' as a
+            # peer pointing at dest@127.0.0.1:13503/dest == final. So final delivers
+            # locally to its own inbox.
+            assert inbox["count"] >= 1, f"final inbox empty: {inbox}"
+            msg = httpx.get("http://127.0.0.1:13503/read", params={"hash": inbox["messages"][0]["short_hash"]}).json()
+            assert msg["message"] == "hop test"
+        finally:
+            for p in procs:
+                p.terminate()

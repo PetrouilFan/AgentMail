@@ -9,8 +9,8 @@ REPO="$HOME/Projects/AgentMail"
 cd "$REPO" || exit 1
 source .venv/bin/activate 2>/dev/null || true
 
-# 1. keep mesh.yaml fresh
-python tools/gen_mesh.py ~/.agentmail/config.yaml mesh.yaml >/dev/null 2>&1
+# 1. keep mesh.yaml fresh (use the package CLI — single source of truth)
+agentmail mesh export --config ~/.agentmail/config.yaml --out mesh.yaml >/dev/null 2>&1
 
 # 2. keep ping-pong loop alive
 if ! pgrep -f "pingpong_hermes.py" >/dev/null 2>&1; then

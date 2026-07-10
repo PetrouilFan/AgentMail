@@ -189,23 +189,34 @@ def _cli() -> None:
     # When invoked via `agentmail bridge ...`, sys.argv[1] is "bridge".
     # Strip it so the bridge's own argparse only sees its real flags.
     import sys
+    import yaml
     argv = sys.argv[1:]
     if argv and argv[0] == "bridge":
         argv = argv[1:]
     p = argparse.ArgumentParser(prog="agentmail-bridge", description="AgentMail task-mail gateway adapter")
-    p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="AgentMail config path")
-    p.add_argument("--url", default="http://localhost:12345", help="Local AgentMail server URL")
-    p.add_argument("--poll", type=int, default=DEFAULT_POLL, help="Poll interval seconds")
-    p.add_argument("--max-iters", type=int, default=0, help="0 = run forever")
+    p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="AgentMail server config path")
+    p.add_argument("--bridge-config", default=None, help="Bridge config YAML (poll/url/max_iters); CLI flags override")
+    p.add_argument("--url", default=None, help="Local AgentMail server URL")
+    p.add_argument("--poll", type=int, default=None, help="Poll interval seconds")
+    p.add_argument("--max-iters", type=int, default=None, help="0 = run forever")
     p.add_argument("--once", action="store_true", help="Run a single sweep and exit (for testing)")
     args = p.parse_args(argv)
 
+    # Load bridge config file (if any) for defaults; CLI flags take precedence.
+    bcfg: dict = {}
+    if args.bridge_config:
+        bcfg = yaml.safe_load(Path(args.bridge_config).read_text()) or {}
+
+    poll = args.poll if args.poll is not None else bcfg.get("poll", DEFAULT_POLL)
+    url = args.url or bcfg.get("url", "http://localhost:12345")
+    max_iters = args.max_iters if args.max_iters is not None else bcfg.get("max_iters", 0)
+
     cfg_path = Path(args.config)
     if args.once:
-        handled, stop = run_once(args.url, cfg_path, default_dispatch)
+        handled, stop = run_once(url, cfg_path, default_dispatch)
         print(f"one-shot: handled {handled}, stop={stop}")
         sys.exit(0)
-    main_loop(cfg_path, base_url=args.url, poll=args.poll, max_iters=args.max_iters)
+    main_loop(cfg_path, base_url=url, poll=poll, max_iters=max_iters)
 
 
 if __name__ == "__main__":

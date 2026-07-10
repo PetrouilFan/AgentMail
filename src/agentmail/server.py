@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from contextlib import asynccontextmanager
 
 from cryptography.hazmat.primitives import serialization
@@ -61,34 +61,49 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             logger.warning(f"Send failed for {to}: {result.error} — queued for retry")
         return result
 
-    def _relay_federation(mail: Mail) -> bool:
+    def _relay_federation(mail: Mail, hop: int) -> bool:
         """Relay an unresolvable send to known federation routers.
 
         Returns True if at least one relay accepted the mail. Federation is
-        opt-in (defaults.federation); a node relays only when enabled. Each
-        router re-evaluates — if it still can't resolve, it relays onward to
-        ITS routers (loop bounded by the mail id + per-hop dedup at /receive).
+        opt-in (defaults.federation). The mail is forwarded to each router's
+        ``/send`` endpoint (not ``/receive``) so the router re-resolves the
+        ORIGINAL recipient and delivers or relays onward — giving true
+        multi-hop routing. Loops are bounded two ways: (1) the mail id is
+        idempotent at every ``/receive``, and (2) a ``X-AgentMail-Hop`` header
+        is incremented each relay and relay stops once it reaches
+        ``max_federation_hops``.
         """
         if not config.defaults.federation:
             return False
-        # Routers = peers flagged router:true in their transport, or any peer
-        # if no explicit routers are configured (flood-bounded by idempotency).
+        max_hops = config.defaults.max_federation_hops
+        if hop >= max_hops:
+            logger.warning(f"Federation hop limit ({max_hops}) reached for {mail.short_hash}; not relaying")
+            return False
+        # Routers = peers flagged router:true in their transport, or all peers
+        # if no explicit routers are configured.
         routers = [
             e for e in config.agents.values()
             if (config.transports.get(e.transport) or TransportConfig()).router
         ] or list(config.agents.values())
         relayed = False
+        next_hop = hop + 1
         for entry in routers:
             try:
                 scheme = "https" if entry.transport == "https" else "http"
-                # Use the /receive endpoint so the router ingests it as an
-                # incoming mail (and re-resolves + relays/sends onward).
-                url = f"{scheme}://{entry.address.split('@')[-1].split('/')[0]}/receive"
+                url = f"{scheme}://{entry.address.split('@')[-1].split('/')[0]}/send"
                 with httpx.Client(timeout=2.0) as c:
-                    r = c.post(url, json=mail.to_dict())
+                    r = c.post(
+                        url,
+                        params={
+                            "to": mail.to_addr,
+                            "message": mail.message,
+                            "content_type": mail.content_type.value,
+                        },
+                        headers={"X-AgentMail-Hop": str(next_hop)},
+                    )
                 if r.status_code == 200:
                     relayed = True
-                    logger.info(f"Federated {mail.short_hash} via router {entry.address}")
+                    logger.info(f"Federated {mail.short_hash} (hop {next_hop}) via router {entry.address}")
             except Exception as e:
                 logger.warning(f"Federation relay to {entry.address} failed: {e}")
         return relayed
@@ -155,6 +170,7 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
         message: str,
         content_type: str = "text/plain",
         from_addr: Optional[str] = None,
+        request: Request = None,
     ):
         """Send a message to an agent.
 
@@ -194,7 +210,12 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             # Not in our translation table. If federation is enabled, attempt
             # to relay through a known router before giving up.
             if config.defaults.federation:
-                relay_to = to if "@" in to else to
+                hop = 0
+                if request is not None:
+                    try:
+                        hop = int(request.headers.get("X-AgentMail-Hop", "0"))
+                    except (TypeError, ValueError):
+                        hop = 0
                 relay_mail = Mail(
                     from_addr=sender,
                     to_addr=(to if "@" in to else to),
@@ -210,7 +231,7 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
                             format=serialization.PublicFormat.SubjectPublicKeyInfo,
                         ))
                     relay_mail.sign(keyring)
-                if _relay_federation(relay_mail):
+                if _relay_federation(relay_mail, hop):
                     return {
                         "status": "federated",
                         "mail_hash": relay_mail.short_hash,

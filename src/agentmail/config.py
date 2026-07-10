@@ -31,6 +31,7 @@ class DefaultsConfig(BaseModel):
     archive_after_days: Optional[int] = None
     require_signature: bool = False
     federation: bool = False
+    max_federation_hops: int = 5
 
 
 class IdentityConfig(BaseModel):
