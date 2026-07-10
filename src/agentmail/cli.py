@@ -21,8 +21,10 @@ import sys
 from pathlib import Path
 
 import httpx
+import yaml
 
 from .config import DEFAULT_CONFIG_PATH, init_config_dir, load_config
+from .bridge import _cli as _bridge_cli
 
 
 DEFAULT_URL = "http://localhost:12345"
@@ -310,7 +312,6 @@ def cmd_keygen(args: argparse.Namespace) -> None:
 
 def cmd_serve(args: argparse.Namespace) -> None:
     """Start the AgentMail server."""
-    import ssl
     import uvicorn
     from pathlib import Path as _Path
 
@@ -327,7 +328,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     # TLS termination: if the transport declares tls:true (and certs are
     # present), serve over HTTPS. Cert paths come from the config or flags.
-    ssl_context = None
+    # uvicorn 0.46 takes ssl_certfile/ssl_keyfile (not ssl_context).
+    ssl_kwargs: dict = {}
     if (http_conf and http_conf.tls) or args.tls:
         certfile = args.certfile or (http_conf and getattr(http_conf, "certfile", None))
         keyfile = args.keyfile or (http_conf and getattr(http_conf, "keyfile", None))
@@ -335,8 +337,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             print("Error: TLS enabled but certfile/keyfile not provided. "
                   "Pass --certfile/--keyfile or set tls.certfile in config.")
             sys.exit(1)
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        ssl_kwargs = {"ssl_certfile": certfile, "ssl_keyfile": keyfile}
         print(f"  TLS: enabled (cert={certfile})")
 
     print(f"Starting AgentMail server on {bind_host}:{port}")
@@ -346,7 +347,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # Import the app factory — use the config_path if specified
     from .server import create_app
     app = create_app(config_path=config_path, base_dir=base_dir)
-    uvicorn.run(app, host=bind_host, port=port, ssl_context=ssl_context)
+    uvicorn.run(app, host=bind_host, port=port, **ssl_kwargs)
 
 
 def main() -> None:
@@ -409,11 +410,19 @@ def main() -> None:
     # serve
     p_serve = sub.add_parser("serve", help="Start the AgentMail server")
     p_serve.add_argument("--host", default="0.0.0.0", help="Bind host")
-    p_serve.add_argument("--port", type=int, default=12345, help="Bind port")
+    p_serve.add_argument("--port", type=int, default=None, help="Bind port (default: from config transports.http.port or 12345)")
     p_serve.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file path")
     p_serve.add_argument("--tls", action="store_true", help="Enable TLS (also enabled if config transports.http.tls:true)")
     p_serve.add_argument("--certfile", default=None, help="TLS certificate file (PEM)")
     p_serve.add_argument("--keyfile", default=None, help="TLS private key file (PEM)")
+
+    # bridge (gateway adapter — generic per-node task-mail handler)
+    p_bridge = sub.add_parser("bridge", help="Run the gateway adapter (task-mail bridge)")
+    p_bridge.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="AgentMail config path")
+    p_bridge.add_argument("--url", default="http://localhost:12345", help="Local AgentMail server URL")
+    p_bridge.add_argument("--poll", type=int, default=120, help="Poll interval seconds")
+    p_bridge.add_argument("--max-iters", type=int, default=0, help="0 = run forever")
+    p_bridge.add_argument("--once", action="store_true", help="Run a single sweep and exit (for testing)")
 
     args = parser.parse_args()
 
@@ -429,6 +438,7 @@ def main() -> None:
         "init": cmd_init,
         "keygen": cmd_keygen,
         "serve": cmd_serve,
+        "bridge": lambda args: _bridge_cli(),
     }
 
     if args.command in commands:

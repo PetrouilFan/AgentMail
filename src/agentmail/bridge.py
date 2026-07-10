@@ -68,13 +68,21 @@ def run_once(
     base_url: str,
     config_path: Path,
     dispatch: DispatchFn,
+    client: Optional[httpx.Client] = None,
 ) -> tuple[int, bool]:
-    """Process one inbox sweep. Returns (tasks_handled, stop_requested)."""
+    """Process one inbox sweep. Returns (tasks_handled, stop_requested).
+
+    If ``client`` is provided it is used for HTTP calls (enables testing via an
+    in-process ASGI transport); otherwise a real httpx.Client is created.
+    """
     config = load_config(config_path)
     me = _my_address(config)
     handled = 0
     stop = False
-    with httpx.Client(timeout=30.0) as client:
+    own_client = client is None
+    if client is None:
+        client = httpx.Client(timeout=30.0)
+    try:
         inbox = client.get(f"{base_url}/inbox").json()
         for entry in inbox.get("messages", []):
             short = entry["short_hash"]
@@ -133,6 +141,9 @@ def run_once(
                 },
             )
             handled += 1
+    finally:
+        if own_client:
+            client.close()
     return handled, stop
 
 
@@ -175,13 +186,19 @@ def main_loop(
 
 
 def _cli() -> None:
+    # When invoked via `agentmail bridge ...`, sys.argv[1] is "bridge".
+    # Strip it so the bridge's own argparse only sees its real flags.
+    import sys
+    argv = sys.argv[1:]
+    if argv and argv[0] == "bridge":
+        argv = argv[1:]
     p = argparse.ArgumentParser(prog="agentmail-bridge", description="AgentMail task-mail gateway adapter")
     p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="AgentMail config path")
     p.add_argument("--url", default="http://localhost:12345", help="Local AgentMail server URL")
     p.add_argument("--poll", type=int, default=DEFAULT_POLL, help="Poll interval seconds")
     p.add_argument("--max-iters", type=int, default=0, help="0 = run forever")
     p.add_argument("--once", action="store_true", help="Run a single sweep and exit (for testing)")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cfg_path = Path(args.config)
     if args.once:

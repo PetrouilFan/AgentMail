@@ -249,13 +249,15 @@ class Mail(BaseModel):
         """Attach a binary blob as a multipart/mixed part.
 
         Sets content_type to multipart/mixed if not already, so the receiving
-        side knows to interpret ``parts``. Returns self for chaining.
+        side knows to interpret ``parts``. Returns self for chaining. Recomputes
+        full_hash so the envelope stays self-consistent.
         """
         self.parts.append(
             MailPart(filename=filename, content_type=content_type, content=data)
         )
         if self.content_type not in (ContentType.MULTIPART_MIXED,):
             self.content_type = ContentType.MULTIPART_MIXED
+        self.full_hash = self._compute_hash()
         return self
 
     def decode_binary(self) -> list[tuple[str, str, bytes]]:

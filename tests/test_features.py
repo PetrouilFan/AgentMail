@@ -116,7 +116,7 @@ class TestBridge:
             assert r.status_code == 200
 
             # Run the bridge's single sweep against the local server.
-            handled, stop = run_once("http://localhost:12345", cfg, default_dispatch)
+            handled, stop = run_once("http://testserver", cfg, default_dispatch, client=client)
             assert handled == 1
             assert stop is False
 
@@ -215,15 +215,16 @@ class TestFederation:
         )
         app = create_app(config_path=cfg, base_dir=tmp_path)
         with TestClient(app) as client:
-            # No federation, unknown agent → 404 (refused instantly on :1).
-            r = client.post("/send", params={"to": "ghost@127.0.0.1:1/ghost", "message": "hi"})
+            # federation off + bare unknown name → 404 (no relay attempt).
+            r = client.post("/send", params={"to": "ghost", "message": "hi"})
             assert r.status_code == 404
 
     def test_federation_relays_to_router(self, tmp_path):
-        """With federation on, an unknown recipient is relayed to a known router.
+        """With federation on, a bare unknown recipient is relayed to a router.
 
-        The router address points at a closed port (127.0.0.1:1) so the relay
-        fails fast (connection refused) without hanging on a timeout.
+        The router points at a closed port (127.0.0.1:1) so the relay fails
+        fast (connection refused) without hanging on a timeout. The direct
+        send path is not taken because the recipient is a bare name.
         """
         from fastapi.testclient import TestClient
         from agentmail.server import create_app
@@ -240,8 +241,8 @@ class TestFederation:
         )
         app = create_app(config_path=cfg, base_dir=base)
         with TestClient(app) as client:
-            r = client.post("/send", params={"to": "ghost@127.0.0.1:1/ghost", "message": "hi"})
-            # peer@127.0.0.1:1 refuses instantly → relay fails → 404.
+            # bare unknown name → relay branch → peer refuses → relay fails → 404.
+            r = client.post("/send", params={"to": "ghost", "message": "hi"})
             assert r.status_code == 404
 
     def test_federation_flag_present_in_defaults(self):
