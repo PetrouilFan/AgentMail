@@ -1,0 +1,32 @@
+# Example AgentMail gateway-adapter (bridge) configuration.
+# The bridge is ONE generic program ANY AgentMail node deploys — it is NOT
+# agent-specific. Copy this beside your config.yaml and run:
+#   agentmail bridge --config ~/.agentmail/config.yaml --poll 120
+# (supervisor is the only per-node detail: systemd on Linux, s6 on TrueNAS,
+#  tmux for local testing — see install.sh / the systemd unit below.)
+
+# Poll interval (seconds) between inbox sweeps.
+poll: 120
+
+# 0 = run forever; N = stop after N sweeps (useful for cron-driven one-shots).
+max_iters: 0
+
+# Local AgentMail server the bridge talks to.
+url: http://localhost:12345
+
+# ── Example systemd unit (drop at /etc/systemd/system/agentmail-bridge.service) ──
+# [Unit]
+# Description=AgentMail gateway adapter
+# After=network.target agentmail.service
+#
+# [Service]
+# Type=simple
+# User=YOUR_USER
+# WorkingDirectory=/home/YOUR_USER/Projects/AgentMail
+# ExecStart=/home/YOUR_USER/Projects/AgentMail/.venv/bin/python -m agentmail bridge \
+#     --config /home/YOUR_USER/.agentmail/config.yaml --poll 120
+# Restart=always
+# RestartSec=5
+#
+# [Install]
+# WantedBy=multi-user.target
