@@ -18,7 +18,7 @@ import shutil
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -33,7 +33,7 @@ MAX_DELAY = 300.0  # 5 minutes ceiling
 class PendingSend(BaseModel):
     """A single undelivered send awaiting retry."""
 
-    mail: dict[str, str] = Field(..., description="mail.to_dict() snapshot")
+    mail: dict[str, Any] = Field(..., description="mail.to_dict() snapshot")
     attempts: int = Field(default=0, description="Number of delivery attempts made")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     next_attempt: datetime = Field(

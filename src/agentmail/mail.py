@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import json
 import uuid
 import uuid6
 from datetime import datetime, timezone
@@ -45,6 +46,36 @@ class ContentType(str, Enum):
     APPLICATION_JSON = "application/json"
     APPLICATION_OCTET_STREAM = "application/octet-stream"
     MULTIPART_MIXED = "multipart/mixed"
+    APPLICATION_X_TASK_REQUEST = "application/x-task-request"
+    APPLICATION_X_TASK_RESULT = "application/x-task-result"
+
+
+class MailPart(BaseModel):
+    """A single part of a multipart/mixed message (a file or binary blob).
+
+    ``content`` is the raw bytes; it is base64-encoded on the wire (in
+    ``Mail.parts_b64``) so the JSON envelope stays valid. ``filename`` is
+    optional but recommended for round-tripping attachments.
+    """
+
+    filename: str = ""
+    content_type: str = "application/octet-stream"
+    content: bytes = b""
+
+    def to_dict(self) -> dict:
+        return {
+            "filename": self.filename,
+            "content_type": self.content_type,
+            "content_b64": base64.b64encode(self.content).decode("ascii"),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MailPart":
+        return cls(
+            filename=d.get("filename", ""),
+            content_type=d.get("content_type", "application/octet-stream"),
+            content=base64.b64decode(d.get("content_b64", "")),
+        )
 
 
 class Mail(BaseModel):
@@ -56,6 +87,8 @@ class Mail(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid6.uuid7()))
     content_type: ContentType = Field(default=ContentType.TEXT_PLAIN)
     message: str = Field(default="", description="The payload body (cleartext unless encrypted)")
+    # Multipart attachments (used when content_type == multipart/mixed).
+    parts: list[MailPart] = Field(default_factory=list, description="Binary/file parts for multipart messages")
     full_hash: str = Field(default="", description="SHA-256 of the core envelope (auto-computed)")
 
     # ── Cryptographic footer (Ed25519 identity) ──
@@ -99,7 +132,8 @@ class Mail(BaseModel):
             f"{self.at.isoformat()}\n"
             f"{self.id}\n"
             f"{self.content_type.value}\n"
-            f"{body}"
+            f"{body}\n"
+            f"{''.join(p.to_dict()['content_b64'] for p in self.parts) if self.parts else ''}"
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -185,7 +219,7 @@ class Mail(BaseModel):
 
     # ── Serialization ──────────────────────────────────────────
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize to a flat dict suitable for JSON storage or API responses."""
         return {
             "from": self.from_addr,
@@ -194,6 +228,7 @@ class Mail(BaseModel):
             "id": self.id,
             "content-type": self.content_type.value,
             "message": self.message,
+            "parts": [p.to_dict() for p in self.parts],
             "full_hash": self.full_hash,
             "signature": self.signature,
             "public_key": self.public_key,
@@ -202,6 +237,97 @@ class Mail(BaseModel):
             "nonce": self.nonce,
             "ephemeral_key": self.ephemeral_key,
         }
+
+    # ── Binary / multipart convenience helpers ───────────────────
+
+    def add_binary_part(
+        self,
+        data: bytes,
+        filename: str = "",
+        content_type: str = "application/octet-stream",
+    ) -> "Mail":
+        """Attach a binary blob as a multipart/mixed part.
+
+        Sets content_type to multipart/mixed if not already, so the receiving
+        side knows to interpret ``parts``. Returns self for chaining.
+        """
+        self.parts.append(
+            MailPart(filename=filename, content_type=content_type, content=data)
+        )
+        if self.content_type not in (ContentType.MULTIPART_MIXED,):
+            self.content_type = ContentType.MULTIPART_MIXED
+        return self
+
+    def decode_binary(self) -> list[tuple[str, str, bytes]]:
+        """Return [(filename, content_type, content)] for multipart messages."""
+        return [(p.filename, p.content_type, p.content) for p in self.parts]
+
+    # ── Structured task-mail (protocol-level wire contract) ──────
+
+    @classmethod
+    def make_task_request(
+        cls,
+        from_addr: str,
+        to_addr: str,
+        task_id: str,
+        payload: dict,
+        reply_to: str | None = None,
+        ttl: int | None = None,
+    ) -> "Mail":
+        """Build an application/x-task-request Mail (protocol wire contract)."""
+        body = {
+            "task_id": task_id,
+            "reply_to": reply_to or from_addr,
+            "payload": payload,
+        }
+        if ttl is not None:
+            body["ttl"] = ttl
+        return cls(
+            from_addr=from_addr,
+            to_addr=to_addr,
+            content_type=ContentType.APPLICATION_X_TASK_REQUEST,
+            message=json.dumps(body, separators=(",", ":")),
+        )
+
+    @classmethod
+    def make_task_result(
+        cls,
+        from_addr: str,
+        to_addr: str,
+        task_id: str,
+        status: str,
+        result: Any = None,
+        error: str | None = None,
+        agent: str | None = None,
+    ) -> "Mail":
+        """Build an application/x-task-result Mail (protocol wire contract)."""
+        body = {"task_id": task_id, "status": status}
+        if result is not None:
+            body["result"] = result
+        if error is not None:
+            body["error"] = error
+        if agent is not None:
+            body["agent"] = agent
+        return cls(
+            from_addr=from_addr,
+            to_addr=to_addr,
+            content_type=ContentType.APPLICATION_X_TASK_RESULT,
+            message=json.dumps(body, separators=(",", ":")),
+        )
+
+    def parse_task(self) -> dict:
+        """Parse a task-request/task-result body into a dict.
+
+        Raises ValueError if the content-type is not a task type or if the
+        JSON is invalid. This is the only contract consumer code should rely
+        on — it keeps the schema enforcement in one place (protocol-general).
+        """
+        if self.content_type not in (
+            ContentType.APPLICATION_X_TASK_REQUEST,
+            ContentType.APPLICATION_X_TASK_RESULT,
+        ):
+            raise ValueError(f"not a task message: {self.content_type}")
+        return json.loads(self.message)
 
     @classmethod
     def from_dict(cls, data: dict[str, str]) -> "Mail":
@@ -213,6 +339,7 @@ class Mail(BaseModel):
             id=data["id"],
             content_type=ContentType(data.get("content-type", "text/plain")),
             message=data.get("message", ""),
+            parts=[MailPart.from_dict(p) for p in data.get("parts", [])],
             full_hash=data.get("full_hash", ""),
             signature=data.get("signature", ""),
             public_key=data.get("public_key", ""),

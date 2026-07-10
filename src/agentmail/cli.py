@@ -225,6 +225,66 @@ def cmd_trust(args: argparse.Namespace) -> None:
     print(f"✓ Added '{name}' to translation table → {address} ({transport})")
 
 
+def cmd_mesh(args: argparse.Namespace) -> None:
+    """Manage the mesh roster: import / export peers in one shot.
+
+    Protocol-general: any node can generate or consume a roster of PUBLIC
+    keys. Importing merges every entry into the translation table + keyring
+    (idempotent). Never touches private keys.
+    """
+    from .config import (
+        load_config,
+        save_config,
+        AgentEntry,
+        DEFAULT_CONFIG_PATH,
+    )
+    from .crypto import KeyRing
+
+    cfg_path = Path(args.config) if getattr(args, "config", None) else DEFAULT_CONFIG_PATH
+
+    if args.mesh_action == "export":
+        out = Path(args.out) if args.out else Path("mesh.yaml")
+        from .mesh_cli import mesh_export
+        mesh_export(cfg_path, out)
+        return
+
+    # import
+    roster_path = Path(args.file)
+    if not roster_path.exists():
+        print(f"Error: roster file not found: {roster_path}")
+        sys.exit(1)
+    with open(roster_path) as f:
+        roster = yaml.safe_load(f) or {}
+    agents = roster.get("agents", {})
+    if not agents:
+        print("Error: roster contains no 'agents'")
+        sys.exit(1)
+
+    kr = KeyRing(base_dir=cfg_path.parent)
+    kr.ensure()
+    config = load_config(cfg_path)
+    added = 0
+    for name, a in agents.items():
+        signing = (a.get("signing_key") or "").strip()
+        enc = (a.get("encryption_key") or "").strip()
+        if not signing:
+            continue
+        if not args.no_keys and enc:
+            kr.add_known_agent(name, signing.encode("ascii"), enc.encode("ascii"))
+        address = a.get("address") or f"{name}@localhost:12345/{name}"
+        transport = a.get("transport") or ("https" if "https" in address else "http")
+        config.agents[name] = AgentEntry(
+            address=address, transport=transport, public_key=signing
+        )
+        added += 1
+        print(f"✓ Imported '{name}' → {address} ({transport})"
+              + ("  [keys]" if (not args.no_keys and enc) else "  [table only]"))
+
+    save_config(config, cfg_path)
+    scheme = "merge" if args.no_keys else "merge (keys + table)"
+    print(f"\nImported {added} agent(s) into {cfg_path} ({scheme}).")
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     """Initialize the AgentMail config directory."""
     config_dir = init_config_dir()
@@ -250,6 +310,7 @@ def cmd_keygen(args: argparse.Namespace) -> None:
 
 def cmd_serve(args: argparse.Namespace) -> None:
     """Start the AgentMail server."""
+    import ssl
     import uvicorn
     from pathlib import Path as _Path
 
@@ -264,6 +325,20 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if http_conf and not args.port:
         port = http_conf.port
 
+    # TLS termination: if the transport declares tls:true (and certs are
+    # present), serve over HTTPS. Cert paths come from the config or flags.
+    ssl_context = None
+    if (http_conf and http_conf.tls) or args.tls:
+        certfile = args.certfile or (http_conf and getattr(http_conf, "certfile", None))
+        keyfile = args.keyfile or (http_conf and getattr(http_conf, "keyfile", None))
+        if not certfile or not keyfile:
+            print("Error: TLS enabled but certfile/keyfile not provided. "
+                  "Pass --certfile/--keyfile or set tls.certfile in config.")
+            sys.exit(1)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        print(f"  TLS: enabled (cert={certfile})")
+
     print(f"Starting AgentMail server on {bind_host}:{port}")
     print(f"  Identity: {config.identity.name}")
     print(f"  Config: {config_path}")
@@ -271,7 +346,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # Import the app factory — use the config_path if specified
     from .server import create_app
     app = create_app(config_path=config_path, base_dir=base_dir)
-    uvicorn.run(app, host=bind_host, port=port)
+    uvicorn.run(app, host=bind_host, port=port, ssl_context=ssl_context)
 
 
 def main() -> None:
@@ -315,6 +390,14 @@ def main() -> None:
     p_trust.add_argument("url", help="Base URL of the agent to trust (e.g. http://host:12345)")
     p_trust.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file to update")
 
+    # mesh
+    p_mesh = sub.add_parser("mesh", help="Manage the mesh roster (import/export peers)")
+    p_mesh.add_argument("mesh_action", choices=["import", "export"], help="import a roster or export one")
+    p_mesh.add_argument("file", nargs="?", default=None, help="Roster YAML file (for import; for export: --out)")
+    p_mesh.add_argument("--out", default=None, help="Output path for export (default: mesh.yaml)")
+    p_mesh.add_argument("--no-keys", action="store_true", help="Import translation table only (skip keyring keys)")
+    p_mesh.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file to update")
+
     # init
     sub.add_parser("init", help="Initialize config directory")
 
@@ -328,6 +411,9 @@ def main() -> None:
     p_serve.add_argument("--host", default="0.0.0.0", help="Bind host")
     p_serve.add_argument("--port", type=int, default=12345, help="Bind port")
     p_serve.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Config file path")
+    p_serve.add_argument("--tls", action="store_true", help="Enable TLS (also enabled if config transports.http.tls:true)")
+    p_serve.add_argument("--certfile", default=None, help="TLS certificate file (PEM)")
+    p_serve.add_argument("--keyfile", default=None, help="TLS private key file (PEM)")
 
     args = parser.parse_args()
 
@@ -339,6 +425,7 @@ def main() -> None:
         "archive": cmd_archive,
         "ping": cmd_ping,
         "trust": cmd_trust,
+        "mesh": cmd_mesh,
         "init": cmd_init,
         "keygen": cmd_keygen,
         "serve": cmd_serve,

@@ -30,6 +30,7 @@ class DefaultsConfig(BaseModel):
     max_retries: int = 5
     archive_after_days: Optional[int] = None
     require_signature: bool = False
+    federation: bool = False
 
 
 class IdentityConfig(BaseModel):
@@ -46,6 +47,8 @@ class TransportConfig(BaseModel):
     token: str = ""
     router: bool = False
     tls: bool = False
+    certfile: str = ""
+    keyfile: str = ""
 
 
 def save_config(config: AgentMailConfig, path: Optional[Path] = None) -> Path:

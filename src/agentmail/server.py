@@ -16,13 +16,14 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from contextlib import asynccontextmanager
 
 from cryptography.hazmat.primitives import serialization
 
 from .mail import Mail, ContentType
-from .config import AgentMailConfig, load_config, resolve_address, init_config_dir
+from .config import AgentMailConfig, load_config, resolve_address, init_config_dir, TransportConfig
 from .store import MailboxStore
 from .transport import HTTPTransport, SendResult
 from .queue import RetryQueue
@@ -59,6 +60,38 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             retry_queue.enqueue(mail, error=result.error or "delivery failed", max_retries=max_retries)
             logger.warning(f"Send failed for {to}: {result.error} — queued for retry")
         return result
+
+    def _relay_federation(mail: Mail) -> bool:
+        """Relay an unresolvable send to known federation routers.
+
+        Returns True if at least one relay accepted the mail. Federation is
+        opt-in (defaults.federation); a node relays only when enabled. Each
+        router re-evaluates — if it still can't resolve, it relays onward to
+        ITS routers (loop bounded by the mail id + per-hop dedup at /receive).
+        """
+        if not config.defaults.federation:
+            return False
+        # Routers = peers flagged router:true in their transport, or any peer
+        # if no explicit routers are configured (flood-bounded by idempotency).
+        routers = [
+            e for e in config.agents.values()
+            if (config.transports.get(e.transport) or TransportConfig()).router
+        ] or list(config.agents.values())
+        relayed = False
+        for entry in routers:
+            try:
+                scheme = "https" if entry.transport == "https" else "http"
+                # Use the /receive endpoint so the router ingests it as an
+                # incoming mail (and re-resolves + relays/sends onward).
+                url = f"{scheme}://{entry.address.split('@')[-1].split('/')[0]}/receive"
+                with httpx.Client(timeout=2.0) as c:
+                    r = c.post(url, json=mail.to_dict())
+                if r.status_code == 200:
+                    relayed = True
+                    logger.info(f"Federated {mail.short_hash} via router {entry.address}")
+            except Exception as e:
+                logger.warning(f"Federation relay to {entry.address} failed: {e}")
+        return relayed
 
     async def _retry_worker() -> None:
         """Background loop: retry any due pending sends with backoff."""
@@ -143,16 +176,9 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
             port = (http_conf.port if http_conf else 12345)
             sender = f"{config.identity.name}@{host}:{port}/{config.identity.name}"
 
-        # Resolve recipient
-        entry = resolve_address(to, config)
-        if not entry and "@" not in to:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Agent '{to}' not found in translation table and not a full address",
-            )
-
         # Validate content type strictly — reject unknown types instead of
-        # silently downgrading to text/plain.
+        # silently downgrading to text/plain. Done before resolution so the
+        # federation relay path below can reuse `ct`.
         try:
             ct = ContentType(content_type)
         except ValueError:
@@ -160,6 +186,41 @@ def create_app(config_path: Optional[Path] = None, base_dir: Optional[Path] = No
                 status_code=400,
                 detail=f"Unsupported content-type '{content_type}'. "
                 f"Supported: {[c.value for c in ContentType]}",
+            )
+
+        # Resolve recipient
+        entry = resolve_address(to, config)
+        if not entry and "@" not in to:
+            # Not in our translation table. If federation is enabled, attempt
+            # to relay through a known router before giving up.
+            if config.defaults.federation:
+                relay_to = to if "@" in to else to
+                relay_mail = Mail(
+                    from_addr=sender,
+                    to_addr=(to if "@" in to else to),
+                    content_type=ct,
+                    message=message,
+                )
+                if keyring.has_identity():
+                    rcpt_name = to.split("/")[-1] if "@" in to else to
+                    rcpt_enc = keyring.known_enc_public(rcpt_name)
+                    if rcpt_enc is not None:
+                        relay_mail.encrypt_for(rcpt_enc.public_bytes(
+                            encoding=serialization.Encoding.PEM,
+                            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                        ))
+                    relay_mail.sign(keyring)
+                if _relay_federation(relay_mail):
+                    return {
+                        "status": "federated",
+                        "mail_hash": relay_mail.short_hash,
+                        "full_hash": relay_mail.full_hash,
+                        "to": relay_mail.to_addr,
+                        "error": None,
+                    }
+            raise HTTPException(
+                status_code=404,
+                detail=f"Agent '{to}' not found in translation table and not a full address",
             )
 
         # Create the Mail object
